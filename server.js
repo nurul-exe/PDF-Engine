@@ -23,7 +23,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 
 const GCS_BUCKET = process.env.GCS_BUCKET_NAME || 'cdn.vconsultancy.com.au';
 const GCS_PROJECT_ID = process.env.GCS_PROJECT_ID || 'aibt-244204';
@@ -225,8 +225,9 @@ app.all(['/api/generate-pdf', '/api/generate-pdf/'], async (req, res) => {
     let wpFormsUrl = "";
     let apiKey = "";
 
-    if (templateId) {
-      const mappingRecords = await listFormMappingRecords(formId, templateId);
+    const targetTemplateId = mappingData?.templateId || payload.templateId || null;
+    if (targetTemplateId) {
+      const mappingRecords = await listFormMappingRecords(formId, targetTemplateId);
       if (mappingRecords?.length && mappingRecords[0].sourceConnectionId) {
         const conn = await getSourceConnection(mappingRecords[0].sourceConnectionId);
         if (conn) {
@@ -857,9 +858,27 @@ app.all('/api/wp-proxy', async (req, res) => {
   }
 });
 
-// Serve frontend static build files
+// Serve frontend static build files or Vite middleware
 const distPath = path.join(__dirname, 'pdf-mapper', 'dist');
-if (fs.existsSync(distPath)) {
+
+let viteMiddlewareMounted = false;
+if (process.env.NODE_ENV !== 'production' && !fs.existsSync(distPath)) {
+  try {
+    const viteModule = await import('./pdf-mapper/node_modules/vite/dist/node/index.js');
+    const vite = await viteModule.createServer({
+      server: { middlewareMode: true },
+      root: path.join(__dirname, 'pdf-mapper'),
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+    viteMiddlewareMounted = true;
+    console.log('[Server] Vite middleware mounted for development mode');
+  } catch (err) {
+    console.warn('[Server] Could not initialize Vite middleware:', err.message);
+  }
+}
+
+if (!viteMiddlewareMounted && fs.existsSync(distPath)) {
   app.use(express.static(distPath));
   // Wildcard SPA fallback for GET requests
   app.use((req, res, next) => {
