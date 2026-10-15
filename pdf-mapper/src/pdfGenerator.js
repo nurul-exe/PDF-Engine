@@ -557,7 +557,9 @@ export async function generateFilledPdf({
             }
             try {
                 field.setFontSize(calculatedFontSize);
-            } catch {
+            } catch (err) {
+                // Ignore font sizing failure on specialized text widgets
+                void err;
             }
 
             auditLog.push({
@@ -585,7 +587,9 @@ export async function generateFilledPdf({
             try {
                 field.select(String(value));
                 filledPdfFieldNames.add(targetName);
-            } catch {
+            } catch (err) {
+                // Ignore dropdown selection mismatch
+                void err;
             }
             auditLog.push({
                 targetName,
@@ -598,7 +602,9 @@ export async function generateFilledPdf({
             try {
                 field.select(String(value));
                 filledPdfFieldNames.add(targetName);
-            } catch {
+            } catch (err) {
+                // Ignore radio button selection mismatch
+                void err;
             }
             auditLog.push({
                 targetName,

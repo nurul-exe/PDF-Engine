@@ -15,7 +15,6 @@ import {
 } from "lucide-react";
 import { analyzePdfBytes } from "../templateAnalyzer";
 import defaultTemplateAnalysis from "../../../template-analysis.json";
-import defaultPdfUrl from "../../../NPA_Credit Transfer Forms_V2.1.pdf";
 import {
     savePdfTemplate,
     GCS_CATEGORY_OPTIONS,
@@ -49,9 +48,6 @@ export default function TemplateIngestionPage({
     onSelectForm,
 }) {
     const [currentAnalysis, setCurrentAnalysis] = useState(activeTemplate?.analysis || defaultTemplateAnalysis);
-    const [currentPdfUrl, setCurrentPdfUrl] = useState(activeTemplate?.url || defaultPdfUrl);
-    const [currentLocalUrl, setCurrentLocalUrl] = useState(activeTemplate?.localUrl || "");
-    const [currentTemplateId, setCurrentTemplateId] = useState(activeTemplate?.id || "");
     const [currentFilename, setCurrentFilename] = useState(activeTemplate?.filename || activeTemplate?.name || "");
     const [selectedCategory, setSelectedCategory] = useState(activeTemplate?.category || "");
     const [activeTab, setActiveTab] = useState("fields"); // "fields", "context", "json"
@@ -68,7 +64,6 @@ export default function TemplateIngestionPage({
     if (activeTemplate && activeTemplate.id !== prevActiveTemplateId) {
         setPrevActiveTemplateId(activeTemplate.id);
         setCurrentAnalysis(activeTemplate.analysis || defaultTemplateAnalysis);
-        setCurrentPdfUrl(activeTemplate.url || defaultPdfUrl);
         setCurrentFilename(activeTemplate.filename || activeTemplate.name || "");
         setSelectedCategory(activeTemplate.category || "");
     }
@@ -116,15 +111,10 @@ export default function TemplateIngestionPage({
             }
 
             const cleanLocalUrl = gcsResponse?.localUrl || `/templates/${encodeURIComponent(selectedCategory)}/${encodeURIComponent(filename)}`;
-            const blob = new Blob([bytes], { type: "application/pdf" });
-            const blobUrl = URL.createObjectURL(blob);
 
             setCurrentAnalysis(analysis);
-            setCurrentPdfUrl(cleanLocalUrl || blobUrl);
-            setCurrentLocalUrl(cleanLocalUrl);
             setCurrentFilename(filename);
             const templateId = `tpl-${Date.now()}`;
-            setCurrentTemplateId(templateId);
             setStatusMsg(`Analysis complete for ${filename}! (${analysis.technical.fieldCount} AcroForm fields mapped)`);
 
             savePdfTemplate({
@@ -153,7 +143,6 @@ export default function TemplateIngestionPage({
     // Reset to NPA Default
     const handleLoadDefault = () => {
         setCurrentAnalysis(defaultTemplateAnalysis);
-        setCurrentPdfUrl(defaultPdfUrl);
         setCurrentFilename("NPA_Credit Transfer Forms_V2.1.pdf");
         setSelectedCategory("NPA");
         setStatusMsg("Loaded built-in NPA Credit Transfer template.");

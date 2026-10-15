@@ -26,6 +26,7 @@ import TemplateIngestModal from "./components/TemplateIngestModal";
 import WpSourceModal from "./components/WpSourceModal";
 import TemplateEditModal from "./components/TemplateEditModal";
 import DatabaseConfigModal from "./components/DatabaseConfigModal";
+import GoogleCloudCredentialsModal from "./components/GoogleCloudCredentialsModal";
 import AsyncProgressBar from "./components/AsyncProgressBar";
 import {
     setActiveWpConnectionId,
@@ -44,6 +45,7 @@ import {
     fetchPdfTemplateRecord,
     persistPdfTemplateRecord,
     checkDatabaseConnection,
+    fetchGcsStatus,
 } from "./connectionManager";
 import { analyzePdfBytes } from "./templateAnalyzer";
 import { extractEntryValue, resolvePreviewValue, formatDate, parseListRows } from "./pdfGenerator";
@@ -423,7 +425,7 @@ async function loadGravityForms(options = {}) {
 
 try {
     let proxyQuery =
-        `/api/wp-proxy?url=${encodeURIComponent(targetUrl)}`;
+        `/api/wp-proxy?url=${encodeURIComponent(requestUrl)}`;
 
     if (sourceConnectionId) {
         proxyQuery += `&sourceConnectionId=${encodeURIComponent(sourceConnectionId)}`;
@@ -576,6 +578,21 @@ function App() {
     const [dbStatus, setDbStatus] = useState({ status: "checking", message: "Checking..." });
     const [isDbModalOpen, setIsDbModalOpen] = useState(false);
 
+    // Google Cloud Storage Connection State & Modal
+    const [gcsStatus, setGcsStatus] = useState(null);
+    const [isGcsModalOpen, setIsGcsModalOpen] = useState(false);
+
+    const loadGcsStatus = useCallback(async () => {
+        try {
+            const status = await fetchGcsStatus();
+            if (status) {
+                setGcsStatus(status);
+            }
+        } catch (err) {
+            console.warn("Error fetching GCS status:", err);
+        }
+    }, []);
+
     const runCheckDb = useCallback(async () => {
         setDbStatus({ status: "checking", message: "Checking..." });
         const res = await checkDatabaseConnection();
@@ -587,7 +604,8 @@ function App() {
 
     useEffect(() => {
         runCheckDb();
-    }, [runCheckDb]);
+        loadGcsStatus();
+    }, [runCheckDb, loadGcsStatus]);
 
     const [selectedTemplate, setSelectedTemplate] = useState(null);
     const [forms, setForms] = useState([]);
@@ -1942,6 +1960,8 @@ function App() {
             dbStatus={dbStatus}
             onCheckDb={runCheckDb}
             onOpenDbConfig={() => setIsDbModalOpen(true)}
+            gcsStatus={gcsStatus}
+            onOpenGcsModal={() => setIsGcsModalOpen(true)}
         />
 
         <main>
@@ -2059,7 +2079,7 @@ function App() {
                     </section>
                     <section className="visual-workspace">
                         <section className="source-panel gravity-source-panel"><div className="panel-heading"><h2>Form schema</h2><p>Choose a field, then click its PDF target.</p></div><GravityFormPanel form={selectedForm} mappings={mappings} activeSource={activeSource} onSelectSource={selectSource} onSelectSystem={selectSystemSource} onRemoveMapping={removeMapping} activeSubmission={activeSubmission} wpSyncInfo={wpSyncInfo} isCheckingWp={isCheckingWp} onRefreshWp={() => handleRefreshWp()} onOpenWpConfig={() => setShowWpConfig(true)} /></section>
-                        <section className="source-panel pdf-source-panel"><div className="panel-heading"><h2>{selectedTemplate?.template?.filename || "PDF template"}</h2><p>Click an existing AcroForm field to assign, edit, or remove mappings.</p></div><PdfViewer source={currentPdfSource} pages={selectedTemplate?.context?.pages} mappedByPdf={mappedByPdf} mappedDetailsByPdf={mappedDetailsByPdf} sourceOptions={sourceOptions} activeSource={activeSource} onFieldSelect={selectPdfField} onRemoveMapping={removePdfMapping} onEditMapping={(field) => { const entry = mappedEntries.find((item) => mappingTargetNames(item, pdfFields).includes(field.name)); if (entry) editMapping(entry); }} onReassignMapping={reassignPdfMapping} /></section>
+                        <section className="source-panel pdf-source-panel"><div className="panel-heading"><h2>{selectedTemplate?.template?.filename || "PDF template"}</h2><p>Click an existing AcroForm field to assign, edit, or remove mappings.</p></div><PdfViewer source={currentPdfSource || selectedTemplate || activePdfTemplate} pages={selectedTemplate?.context?.pages} mappedByPdf={mappedByPdf} mappedDetailsByPdf={mappedDetailsByPdf} sourceOptions={sourceOptions} activeSource={activeSource} onFieldSelect={selectPdfField} onRemoveMapping={removePdfMapping} onEditMapping={(field) => { const entry = mappedEntries.find((item) => mappingTargetNames(item, pdfFields).includes(field.name)); if (entry) editMapping(entry); }} onReassignMapping={reassignPdfMapping} /></section>
                     </section>
                     <section className="mapping-panel">
                         <div className="mapping-header">
@@ -2225,6 +2245,16 @@ function App() {
             dbStatus={dbStatus}
             onCheckDb={runCheckDb}
         />
+        {isGcsModalOpen && (
+            <GoogleCloudCredentialsModal
+                isOpen={isGcsModalOpen}
+                onClose={() => {
+                    setIsGcsModalOpen(false);
+                    loadGcsStatus();
+                }}
+                selectedCategory={activePdfTemplate?.category || "AIBT"}
+            />
+        )}
     </div>;
 }
 

@@ -25,7 +25,7 @@ function WpSourceModalDialog({ connection, onClose, onSave }) {
     const [name, setName] = useState(connection?.name || (isEdit ? "" : "New WordPress Source"));
     const [url, setUrl] = useState(connection?.url || (isEdit ? "" : "https://your-domain.com/wp-json/pdf-generator/v1/forms"));
     const [apiKey, setApiKey] = useState("");
-    const [apiKeyConfigured, setApiKeyConfigured] = useState(connection?.apiKeyConfigured || false);
+    const [apiKeyConfigured] = useState(connection?.apiKeyConfigured || false);
     const [basicUser, setBasicUser] = useState(connection?.basicUser || "");
     const [basicPass, setBasicPass] = useState(connection?.basicPass || "");
     const [isTesting, setIsTesting] = useState(false);

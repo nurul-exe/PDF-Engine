@@ -67,24 +67,53 @@ export const DEFAULT_PDF_TEMPLATE = {
 export function getGcsCredentials() {
     try {
         const raw = localStorage.getItem(GCS_CREDENTIALS_KEY);
-        if (raw) return JSON.parse(raw);
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            return {
+                accessToken: parsed.accessToken || "",
+                serviceAccountKey: parsed.serviceAccountKey || "",
+                bucket: parsed.bucket || GCS_BUCKET,
+                projectId: parsed.projectId || GCS_PROJECT_ID,
+            };
+        }
     } catch {
         // Fall back to empty credentials if storage fails
     }
     return {
         accessToken: "",
         serviceAccountKey: "",
+        bucket: GCS_BUCKET,
+        projectId: GCS_PROJECT_ID,
     };
 }
 
 export function saveGcsCredentials(creds) {
-    localStorage.setItem(GCS_CREDENTIALS_KEY, JSON.stringify(creds));
-    return creds;
+    const updated = {
+        accessToken: creds?.accessToken || "",
+        serviceAccountKey: creds?.serviceAccountKey || "",
+        bucket: creds?.bucket || GCS_BUCKET,
+        projectId: creds?.projectId || GCS_PROJECT_ID,
+    };
+    localStorage.setItem(GCS_CREDENTIALS_KEY, JSON.stringify(updated));
+    return updated;
+}
+
+export async function fetchGcsStatus() {
+    try {
+        const res = await fetch("/api/gcs-status");
+        if (res.ok) {
+            return await res.json();
+        }
+    } catch (err) {
+        console.warn("Could not fetch GCS status:", err);
+    }
+    return null;
 }
 
 export async function uploadTemplateToGcs({ fileBytes, filename, category }) {
     const creds = getGcsCredentials();
-    const tokenOrKey = creds.accessToken || creds.serviceAccountKey || "";
+    const token = typeof creds.accessToken === "string" ? creds.accessToken.trim() : "";
+    const saKey = creds.serviceAccountKey || "";
 
     // Convert Uint8Array to base64
     let binary = "";
@@ -97,8 +126,8 @@ export async function uploadTemplateToGcs({ fileBytes, filename, category }) {
     const headers = {
         "Content-Type": "application/json",
     };
-    if (tokenOrKey) {
-        headers["x-gcs-token"] = tokenOrKey;
+    if (token && !token.includes("\n") && !token.includes("\r")) {
+        headers["x-gcs-token"] = token;
     }
 
     const res = await fetch("/api/gcs-upload", {
@@ -108,11 +137,76 @@ export async function uploadTemplateToGcs({ fileBytes, filename, category }) {
             filename,
             category,
             fileBytesBase64,
+            customToken: token || undefined,
+            serviceAccountKey: saKey || undefined,
+            bucket: creds.bucket || GCS_BUCKET,
+            projectId: creds.projectId || GCS_PROJECT_ID,
         }),
     });
 
     if (!res.ok) {
         throw new Error(`Upload server responded with HTTP ${res.status}`);
+    }
+
+    return await res.json();
+}
+
+/**
+ * Store generated PDF directly in Google Cloud Storage.
+ */
+export async function storePdfInCloud({
+    pdfBytes,
+    formId = "1",
+    entryId = "0",
+    templateId = "Template",
+    category = "AIBT",
+    filename = "",
+    bucket = "",
+    projectId = "",
+}) {
+    const creds = getGcsCredentials();
+    const token = typeof creds.accessToken === "string" ? creds.accessToken.trim() : "";
+    const saKey = creds.serviceAccountKey || "";
+    const targetBucket = bucket || creds.bucket || GCS_BUCKET;
+    const targetProjectId = projectId || creds.projectId || GCS_PROJECT_ID;
+
+    // Chunked conversion to avoid call stack limits
+    let binary = "";
+    const chunkSize = 0x8000;
+    const view = new Uint8Array(pdfBytes);
+    for (let i = 0; i < view.length; i += chunkSize) {
+        binary += String.fromCharCode(...view.subarray(i, i + chunkSize));
+    }
+    const pdfBytesBase64 = btoa(binary);
+
+    const headers = {
+        "Content-Type": "application/json",
+    };
+    // Never put multi-line JSON or RSA private keys in headers as HTTP prohibits CR/LF and throws 'Invalid value'
+    if (token && !token.includes("\n") && !token.includes("\r")) {
+        headers["x-gcs-token"] = token;
+    }
+
+    const res = await fetch("/api/store-pdf-in-cloud", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+            pdfBytesBase64,
+            formId: String(formId),
+            entryId: String(entryId),
+            templateId: String(templateId),
+            category,
+            filename: filename || undefined,
+            customToken: token || undefined,
+            serviceAccountKey: saKey || undefined,
+            bucket: targetBucket,
+            projectId: targetProjectId,
+        }),
+    });
+
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `Failed to store PDF in cloud (HTTP ${res.status})`);
     }
 
     return await res.json();
@@ -375,6 +469,12 @@ export function ensureTemplateAnalysis(t) {
     };
 }
 
+export function isPdfBuffer(uint8Array) {
+    if (!uint8Array || uint8Array.byteLength < 4) return false;
+    // Magic bytes for PDF: %PDF (0x25, 0x50, 0x44, 0x46)
+    return uint8Array[0] === 0x25 && uint8Array[1] === 0x50 && uint8Array[2] === 0x44 && uint8Array[3] === 0x46;
+}
+
 export function resolvePdfUrl(tpl) {
     if (!tpl) return null;
     if (typeof tpl === "string") {
@@ -385,92 +485,131 @@ export function resolvePdfUrl(tpl) {
         return tpl;
     }
 
-    const filename = tpl.filename || tpl.name || tpl.template?.filename || "";
-    const cleanFilename = filename.replace(/%20/g, "_").replace(/ /g, "_");
-    const category = tpl.category || "AIBT";
-
-    // If local templates exist in public
-    if (cleanFilename) {
-        const localCandidate = `/templates/${encodeURIComponent(category)}/${encodeURIComponent(cleanFilename)}`;
-        if (tpl.url && (tpl.url === localCandidate || tpl.url.startsWith("/templates/"))) {
-            return tpl.url;
-        }
-    }
-
-    if (tpl.url && !tpl.url.startsWith("blob:")) {
-        if ((tpl.url.startsWith("http://") || tpl.url.startsWith("https://")) && typeof window !== "undefined" && !tpl.url.includes(window.location.host)) {
-            return `/api/wp-proxy?url=${encodeURIComponent(tpl.url)}`;
-        }
+    // 1. If tpl.url is a valid blob URL (in-memory loaded in current session), use it directly!
+    if (tpl.url && tpl.url.startsWith("blob:")) {
         return tpl.url;
     }
 
+    // 2. If tpl has a remote sourceUrl (e.g. from Google Cloud Storage or WordPress), proxy it!
+    const remoteUrl = tpl.sourceUrl || (tpl.url && (tpl.url.startsWith("http://") || tpl.url.startsWith("https://")) ? tpl.url : null) || tpl.cdnUrl;
+    if (remoteUrl) {
+        if (typeof window !== "undefined" && !remoteUrl.includes(window.location.host)) {
+            return `/api/wp-proxy?url=${encodeURIComponent(remoteUrl)}`;
+        }
+        return remoteUrl;
+    }
+
+    // 3. If localUrl is provided and not blob
     if (tpl.localUrl && !tpl.localUrl.startsWith("blob:")) {
         return tpl.localUrl;
     }
 
+    // 4. Default NPA template
+    const rawFilename = tpl.filename || tpl.name || tpl.template?.filename || "";
+    if (tpl.id === "default-npa" || rawFilename.includes("NPA_Credit Transfer Forms")) {
+        return "/templates/NPA/NPA_Credit_Transfer_Forms_V2.1.pdf";
+    }
+
+    // 5. If cleanFilename matches local template
+    const cleanFilename = rawFilename.replace(/%20/g, "_").replace(/ /g, "_");
+    const category = tpl.category || "AIBT";
     if (cleanFilename) {
         return `/templates/${encodeURIComponent(category)}/${encodeURIComponent(cleanFilename)}`;
-    }
-
-    if (tpl.sourceUrl) {
-        if ((tpl.sourceUrl.startsWith("http://") || tpl.sourceUrl.startsWith("https://")) && typeof window !== "undefined" && !tpl.sourceUrl.includes(window.location.host)) {
-            return `/api/wp-proxy?url=${encodeURIComponent(tpl.sourceUrl)}`;
-        }
-        return tpl.sourceUrl;
-    }
-
-    if (tpl.cdnUrl) {
-        if ((tpl.cdnUrl.startsWith("http://") || tpl.cdnUrl.startsWith("https://")) && typeof window !== "undefined" && !tpl.cdnUrl.includes(window.location.host)) {
-            return `/api/wp-proxy?url=${encodeURIComponent(tpl.cdnUrl)}`;
-        }
-        return tpl.cdnUrl;
     }
 
     return tpl.url || null;
 }
 
-export async function fetchPdfBytes(templateOrUrl, sourceConnectionId = null) {
+export async function fetchPdfBytes(templateOrUrl, _sourceConnectionId = null) {
+    void _sourceConnectionId;
     if (!templateOrUrl) return null;
-    if (templateOrUrl instanceof Uint8Array) return { bytes: templateOrUrl, successfulUrl: "" };
-    if (templateOrUrl instanceof ArrayBuffer) return { bytes: new Uint8Array(templateOrUrl), successfulUrl: "" };
+    if (templateOrUrl instanceof Uint8Array) {
+        if (isPdfBuffer(templateOrUrl)) return { bytes: templateOrUrl, successfulUrl: "" };
+        return null;
+    }
+    if (templateOrUrl instanceof ArrayBuffer) {
+        const u8 = new Uint8Array(templateOrUrl);
+        if (isPdfBuffer(u8)) return { bytes: u8, successfulUrl: "" };
+        return null;
+    }
 
     const candidates = [];
     if (typeof templateOrUrl === "string") {
-        candidates.push(templateOrUrl);
+        const str = templateOrUrl;
+        if (str.startsWith("blob:")) {
+            candidates.push(str);
+        } else if (str.startsWith("http://") || str.startsWith("https://")) {
+            candidates.push(`/api/wp-proxy?url=${encodeURIComponent(str)}`);
+            candidates.push(str);
+        } else if (str.startsWith("/api/wp-proxy")) {
+            candidates.push(str);
+        } else {
+            // Check if string matches any registered template
+            const list = getPdfTemplates();
+            const matched = list.find((t) => t.id === str || t.filename === str || t.url === str);
+            if (matched) {
+                if (matched.url && matched.url.startsWith("blob:")) candidates.push(matched.url);
+                if (matched.sourceUrl) {
+                    candidates.push(`/api/wp-proxy?url=${encodeURIComponent(matched.sourceUrl)}`);
+                    candidates.push(matched.sourceUrl);
+                }
+                if (matched.cdnUrl) {
+                    candidates.push(`/api/wp-proxy?url=${encodeURIComponent(matched.cdnUrl)}`);
+                    candidates.push(matched.cdnUrl);
+                }
+                if (matched.url && !matched.url.startsWith("blob:")) {
+                    if (matched.url.startsWith("http://") || matched.url.startsWith("https://")) {
+                        candidates.push(`/api/wp-proxy?url=${encodeURIComponent(matched.url)}`);
+                    }
+                    candidates.push(matched.url);
+                }
+            }
+            candidates.push(str);
+        }
     } else {
         const tpl = templateOrUrl;
         const category = tpl.category || "AIBT";
         const rawFilename = tpl.filename || tpl.name || tpl.template?.filename || "";
         const cleanFilename = rawFilename.replace(/%20/g, "_").replace(/ /g, "_");
 
+        // 1. In-memory blob URL
+        if (tpl.url && tpl.url.startsWith("blob:")) {
+            candidates.push(tpl.url);
+        }
+
+        // 2. Remote source URL
+        if (tpl.sourceUrl) {
+            candidates.push(`/api/wp-proxy?url=${encodeURIComponent(tpl.sourceUrl)}`);
+            candidates.push(tpl.sourceUrl);
+        }
+
+        // 3. CDN URL
+        if (tpl.cdnUrl) {
+            candidates.push(`/api/wp-proxy?url=${encodeURIComponent(tpl.cdnUrl)}`);
+            candidates.push(tpl.cdnUrl);
+        }
+
+        // 4. Remote HTTP URL
+        if (tpl.url && !tpl.url.startsWith("blob:") && (tpl.url.startsWith("http://") || tpl.url.startsWith("https://"))) {
+            candidates.push(`/api/wp-proxy?url=${encodeURIComponent(tpl.url)}`);
+            candidates.push(tpl.url);
+        }
+
+        // 5. Local URL
+        if (tpl.localUrl && !tpl.localUrl.startsWith("blob:")) {
+            candidates.push(tpl.localUrl);
+        }
+
+        // 6. NPA default template
         if (tpl.id === DEFAULT_PDF_TEMPLATE.id || rawFilename.includes("NPA_Credit Transfer Forms")) {
             candidates.push(defaultPdfBytesUrl);
             candidates.push("/templates/NPA/NPA_Credit_Transfer_Forms_V2.1.pdf");
         }
 
+        // 7. Local template files
         if (cleanFilename) {
             candidates.push(`/templates/${encodeURIComponent(category)}/${encodeURIComponent(cleanFilename)}`);
             candidates.push(`/templates/${encodeURIComponent(category)}/${encodeURIComponent(rawFilename)}`);
-        }
-
-        if (tpl.localUrl && !tpl.localUrl.startsWith("blob:")) {
-            candidates.push(tpl.localUrl);
-        }
-
-        if (tpl.url && !tpl.url.startsWith("blob:")) {
-            candidates.push(tpl.url);
-        }
-
-        if (tpl.sourceUrl) {
-            candidates.push(tpl.sourceUrl);
-        }
-
-        if (tpl.cdnUrl) {
-            candidates.push(tpl.cdnUrl);
-        }
-
-        if (tpl.url && tpl.url.startsWith("blob:")) {
-            candidates.push(tpl.url);
         }
     }
 
@@ -480,8 +619,9 @@ export async function fetchPdfBytes(templateOrUrl, sourceConnectionId = null) {
             const res = await fetch(url);
             if (res.ok) {
                 const buf = await res.arrayBuffer();
-                if (buf && buf.byteLength > 100) {
-                    return { bytes: new Uint8Array(buf), successfulUrl: url };
+                const bytes = new Uint8Array(buf);
+                if (isPdfBuffer(bytes)) {
+                    return { bytes, successfulUrl: url };
                 }
             }
         } catch {
@@ -572,7 +712,20 @@ export function savePdfTemplate(tpl) {
         list.push(item);
     }
     localStorage.setItem(PDF_TEMPLATES_KEY, JSON.stringify(list));
-    void persistPdfTemplateRecord({ ...item, templateId: id });
+    void persistPdfTemplateRecord({ ...item, templateId: id }).catch((err) => {
+        console.warn("[PDF Mapper] Background template persistence error:", err.message);
+    });
+    return item;
+}
+
+export async function savePdfTemplateAsync(tpl) {
+    const item = savePdfTemplate(tpl);
+    try {
+        await persistPdfTemplateRecord({ ...item, templateId: item.id });
+    } catch (err) {
+        console.warn("[PDF Mapper] Database sync error:", err.message);
+        throw err;
+    }
     return item;
 }
 
@@ -631,6 +784,7 @@ export async function fetchPdfTemplateRecord(templateId, formId = "") {
 export function deletePdfTemplate(id) {
     const list = getPdfTemplates().filter((t) => t.id !== id);
     localStorage.setItem(PDF_TEMPLATES_KEY, JSON.stringify(list));
+    fetch(`/api/template-records/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
     return list;
 }
 
@@ -670,23 +824,41 @@ export async function ingestPdfFromUrl(url, customName = "", sourceConnectionId 
 
     let buffer = null;
 
-    // Attempt direct fetch first
-    try {
-        const directRes = await fetch(url);
-        if (directRes.ok) {
-            buffer = await directRes.arrayBuffer();
+    // Detect if URL is from Google Cloud Storage or other cloud buckets that need proxying to avoid CORS error in console
+    const isGoogleStorage = url.includes("storage.googleapis.com") || url.includes("googleapis.com");
+
+    if (!isGoogleStorage) {
+        // Attempt direct fetch first for same-origin or CORS-enabled URLs
+        try {
+            const directRes = await fetch(url);
+            if (directRes.ok) {
+                buffer = await directRes.arrayBuffer();
+            }
+        } catch {
+            // Retry via proxy to bypass CORS
         }
-    } catch {
-        // Retry via proxy to bypass CORS
     }
 
     if (!buffer) {
         const proxyUrl = `/api/wp-proxy?url=${encodeURIComponent(url)}${sourceConnectionId ? `&sourceConnectionId=${encodeURIComponent(sourceConnectionId)}` : ''}`;
         const proxyRes = await fetch(proxyUrl);
         if (!proxyRes.ok) {
-            throw new Error(`Failed to download PDF from URL: HTTP ${proxyRes.status}`);
+            if (isGoogleStorage) {
+                try {
+                    const directRes = await fetch(url);
+                    if (directRes.ok) {
+                        buffer = await directRes.arrayBuffer();
+                    }
+                } catch (fallbackErr) {
+                    void fallbackErr;
+                }
+            }
+            if (!buffer) {
+                throw new Error(`Failed to download PDF from URL: HTTP ${proxyRes.status}`);
+            }
+        } else {
+            buffer = await proxyRes.arrayBuffer();
         }
-        buffer = await proxyRes.arrayBuffer();
     }
 
     const filename = customName || url.split("/").pop().split("?")[0] || "downloaded-template.pdf";
@@ -707,6 +879,8 @@ export async function ingestPdfFromUrl(url, customName = "", sourceConnectionId 
     };
 
     savePdfTemplate(newTemplate);
+    // Explicitly await the database persistence
+    await persistPdfTemplateRecord({ ...newTemplate, templateId: newTemplate.id });
     return newTemplate;
 }
 

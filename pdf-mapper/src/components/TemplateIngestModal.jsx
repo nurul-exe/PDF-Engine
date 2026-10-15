@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { X, Cloud, FolderOpen, FileText, CheckCircle2, AlertCircle } from "lucide-react";
-import { ingestPdfFromUrl, savePdfTemplate } from "../connectionManager";
+import { ingestPdfFromUrl, savePdfTemplateAsync } from "../connectionManager";
 import { analyzePdfBytes } from "../templateAnalyzer";
 
 export default function TemplateIngestModal({
@@ -24,9 +24,11 @@ export default function TemplateIngestModal({
         setFeedback(null);
         try {
             const template = await ingestPdfFromUrl(pdfUrl.trim(), customName.trim());
+            const pageCount = template.analysis?.technical?.pages || 1;
+            const fieldCount = template.analysis?.technical?.fieldCount || 0;
             setFeedback({
                 ok: true,
-                message: `Successfully ingested "${template.filename}"! Analyzed ${template.analysis.technical.pages} page(s) and detected ${template.analysis.technical.fieldCount} AcroForm fields.`,
+                message: `Successfully ingested "${template.filename}"! Analyzed ${pageCount} page(s) and detected ${fieldCount} AcroForm fields.`,
             });
             onTemplateAdded(template);
             setTimeout(() => {
@@ -66,10 +68,12 @@ export default function TemplateIngestModal({
                 createdAt: new Date().toISOString(),
             };
 
-            savePdfTemplate(newTemplate);
+            await savePdfTemplateAsync(newTemplate);
+            const pageCount = analysis?.technical?.pages || 1;
+            const fieldCount = analysis?.technical?.fieldCount || 0;
             setFeedback({
                 ok: true,
-                message: `Successfully ingested "${filename}"! Analyzed ${analysis.technical.pages} page(s) with ${analysis.technical.fieldCount} AcroForm fields.`,
+                message: `Successfully ingested "${filename}"! Analyzed ${pageCount} page(s) with ${fieldCount} AcroForm fields.`,
             });
             onTemplateAdded(newTemplate);
             setTimeout(() => {

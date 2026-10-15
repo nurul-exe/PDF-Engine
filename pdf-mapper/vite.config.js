@@ -1,21 +1,6 @@
 import { Buffer } from 'node:buffer'
-import crypto from 'node:crypto'
-import fs from 'node:fs'
-import path from 'node:path'
-import process from 'node:process'
-import { fileURLToPath } from 'node:url'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
-import { analyzePdfBytes } from '../analyze-template.js'
-import { generateFilledPdf } from './src/pdfGenerator.js'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
-const GCS_BUCKET = process.env.GCS_BUCKET_NAME || 'cdn.vconsultancy.com.au'
-const GCS_PROJECT_ID = process.env.GCS_PROJECT_ID || 'aibt-244204'
-const GCS_BASE_PATH = 'pdf-generator/templates'
-const ALLOWED_CATEGORIES = ['AIBT', 'AIBT-I', 'AVTA', 'NPA', 'BIC', 'REACH', 'HJ', 'Pivot', 'Profound', 'Others']
 
 function getRequestBody(req) {
   return new Promise((resolve, reject) => {
@@ -24,16 +9,6 @@ function getRequestBody(req) {
     req.on('end', () => resolve(Buffer.concat(chunks)))
     req.on('error', reject)
   })
-}
-
-async function getGoogleAccessToken(explicitToken) {
-  if (explicitToken && explicitToken.trim()) {
-    return explicitToken.trim()
-  }
-  if (process.env.GCS_ACCESS_TOKEN) {
-    return process.env.GCS_ACCESS_TOKEN.trim()
-  }
-  return null
 }
 
 function wpProxyPlugin() {

@@ -6,16 +6,15 @@ import {
     Paperclip,
     CheckCircle2,
     Check,
-    Send,
+    Cloud,
     Download,
     Eye,
     Loader2,
     Cpu
 } from "lucide-react";
-import { getAutomationSettings, saveAutomationSettings, fetchPdfBytes } from "../connectionManager";
+import { getAutomationSettings, saveAutomationSettings, fetchPdfBytes, storePdfInCloud } from "../connectionManager";
 import { fetchFormSubmissions } from "../submissionService";
 import { generateFilledPdf } from "../pdfGenerator";
-import { normalizeWpFormsUrl } from "../mappingUtils";
 import "./AutomationDispatchPage.css";
 
 function triggerDownload(pdfBytes, filename) {
@@ -42,16 +41,6 @@ export default function AutomationDispatchPage({
     sourceConnectionId,
     onOpenTester,
 }) {
-    // Chunked Uint8Array to base64 conversion to avoid Maximum call stack size exceeded
-    function uint8ArrayToBase64(bytes) {
-        let binary = '';
-        const chunkSize = 0x8000;
-        const view = new Uint8Array(bytes);
-        for (let i = 0; i < view.length; i += chunkSize) {
-            binary += String.fromCharCode(...view.subarray(i, i + chunkSize));
-        }
-        return btoa(binary);
-    }
     const [settings, setSettings] = useState(() => getAutomationSettings());
     const [submissions, setSubmissions] = useState([]);
     const [isLoadingSubmissions, setIsLoadingSubmissions] = useState(false);
@@ -139,46 +128,33 @@ export default function AutomationDispatchPage({
         }
     };
 
-    // Generate & Push to WordPress server (stores in wp-content/pdf-generator/generated/ & triggers email)
-    const handleGenerateAndPushToWp = async (entry, sendNotification = true) => {
+    // Generate & Store PDF in Google Cloud Storage
+    const handleGenerateAndStoreInCloud = async (entry) => {
         setPushingEntryId(entry.id);
-        setDispatchNotice(`Generating and transmitting filled PDF for Entry #${entry.id} to WordPress...`);
+        setDispatchNotice(`Generating and storing filled PDF for Entry #${entry.id} in Google Cloud Storage...`);
         try {
             const result = await buildPdfBytesForEntry(entry);
+            const formId = selectedForm?.id || '1';
+            const templateId = activePdfTemplate?.id || 'Template';
+            const category = activePdfTemplate?.category || 'AIBT';
 
-            // Convert Uint8Array PDF bytes to base64 using browser-compatible API (chunked)
-            const pdfBytesBase64 = uint8ArrayToBase64(result.pdfBytes);
-
-            const pushRes = await fetch('/api/push-pdf-to-wp', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    pdfBytesBase64,
-                    formId: selectedForm?.id || '1',
-                    entryId: entry.id,
-                    templateId: activePdfTemplate?.id || null,
-                    sourceConnectionId,
-                    sendNotification,
-                }),
+            const json = await storePdfInCloud({
+                pdfBytes: result.pdfBytes,
+                formId,
+                entryId: entry.id,
+                templateId,
+                category,
             });
 
-            if (!pushRes.ok) {
-                const errData = await pushRes.json().catch(() => ({}));
-                throw new Error(errData.error || `Push failed (${pushRes.status})`);
-            }
-
-            const json = await pushRes.json();
             setPushedEntries((prev) => new Set([...prev, String(entry.id)]));
             processedIdsRef.current.add(String(entry.id));
 
             setDispatchNotice(
-                `Stored on WordPress: ${json.filename || `entry-${entry.id}.pdf`} (${result.filledCount} fields filled). ${
-                    json.notificationSent ? "Email notification with PDF attachment dispatched." : ""
-                }`
+                `Stored in Cloud: ${json.gcsUri || json.filename} (${result.filledCount} fields filled). ${json.message}`
             );
         } catch (err) {
-            console.error("Push to WordPress failed:", err);
-            setDispatchNotice(`Push to WordPress failed: ${err.message}`);
+            console.error("Store in Cloud failed:", err);
+            setDispatchNotice(`Store in Cloud failed: ${err.message}`);
         } finally {
             setPushingEntryId(null);
         }
@@ -233,10 +209,10 @@ export default function AutomationDispatchPage({
             {/* Header */}
             <div className="automation-header">
                 <div>
-                    <span className="section-kicker">Step 3 • Live Automation & Dispatch Monitor</span>
-                    <h2>Automation, Storage & Email Notifications</h2>
+                    <span className="section-kicker">Step 3 • Live Automation & Cloud Dispatch Monitor</span>
+                    <h2>Automation & Cloud Storage</h2>
                     <p>
-                        Generate filled PDFs with your saved mapping for Gravity Forms submissions, store them directly on your WordPress server, and attach them to notification emails.
+                        Generate filled PDFs with your saved mapping for Gravity Forms submissions and store them directly in Google Cloud Storage.
                     </p>
                 </div>
 
@@ -263,7 +239,7 @@ export default function AutomationDispatchPage({
             <div className="automation-matrix-card">
                 <div className="matrix-card-header">
                     <h3>Form Generation Matrix</h3>
-                    <p>Each form can be individually enabled/disabled for automated PDF generation.</p>
+                    <p>Each form can be individually enabled/disabled for automated PDF generation and cloud storage.</p>
                 </div>
 
                 <div className="matrix-table-wrap">
@@ -273,8 +249,8 @@ export default function AutomationDispatchPage({
                                 <th>Form ID</th>
                                 <th>Form Title</th>
                                 <th>Assigned PDF Template</th>
-                                <th>Storage Location</th>
-                                <th>Auto-Email Attachment</th>
+                                <th>Cloud Storage Target</th>
+                                <th>Cloud Sync Status</th>
                                 <th>Status</th>
                                 <th>Toggle</th>
                             </tr>
@@ -291,7 +267,7 @@ export default function AutomationDispatchPage({
                                     const formConf = (settings.forms || {})[form.id] || {
                                         enabled: false,
                                         templateId: activePdfTemplate?.id || "",
-                                        storagePath: "wp-content/pdf-generator/generated/",
+                                        storagePath: "pdf-generator/generated/",
                                         emailNotificationEnabled: true,
                                     };
                                     const isEnabled = !!formConf.enabled;
@@ -328,13 +304,13 @@ export default function AutomationDispatchPage({
                                             </td>
 
                                         <td className="col-storage">
-                                            <code>wp-content/pdf-generator/generated/</code>
+                                            <code>gs://cdn.vconsultancy.com.au/pdf-generator/generated/</code>
                                         </td>
 
                                         <td className="col-email">
                                             <span className="badge-email-active">
-                                                <Check size={11} style={{ display: "inline-block", marginRight: "4px", verticalAlign: "middle" }} />
-                                                gform_notification Filter
+                                                <Cloud size={11} style={{ display: "inline-block", marginRight: "4px", verticalAlign: "middle" }} />
+                                                GCP Cloud Storage
                                             </span>
                                         </td>
 
@@ -480,7 +456,7 @@ export default function AutomationDispatchPage({
                                                 <button
                                                     type="button"
                                                     style={{
-                                                        background: "#2980b9",
+                                                        background: "#0f766e",
                                                         color: "#fff",
                                                         border: "none",
                                                         padding: "6px 12px",
@@ -492,18 +468,18 @@ export default function AutomationDispatchPage({
                                                         alignItems: "center",
                                                         gap: "5px",
                                                     }}
-                                                    onClick={() => handleGenerateAndPushToWp(sub, true)}
+                                                    onClick={() => handleGenerateAndStoreInCloud(sub)}
                                                     disabled={isPushing || isGenerating}
                                                 >
                                                     {isPushing ? (
                                                         <>
                                                             <Loader2 size={12} className="animate-spin" />
-                                                            Pushing to WP...
+                                                            Storing in Cloud...
                                                         </>
                                                     ) : (
                                                         <>
-                                                            <Send size={12} />
-                                                            Push PDF to WP & Email
+                                                            <Cloud size={12} />
+                                                            Store in Cloud
                                                         </>
                                                     )}
                                                 </button>

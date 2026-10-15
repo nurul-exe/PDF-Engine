@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "version": 1,
   "description": "Database registry for Gravity Form Sources (WordPress & External API instances) and PDF Template Targets (Local files, Google Cloud Storage & CDN URLs).",
-  "lastUpdated": "2026-09-29T12:22:48.922Z",
+  "lastUpdated": "2026-10-15T12:37:24.864Z",
   "activeWpConnectionId": "default-localwp",
   "activePdfTemplateId": "default-npa",
   "gravityFormSources": [

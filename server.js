@@ -17,7 +17,18 @@ import {
   createFormMappingRecord,
   archiveSourceConnection,
   upsertSourceForms,
+  upsertPdfTemplateRecord,
+  deletePdfTemplateRecord,
 } from './database.js';
+
+import {
+  getGoogleAccessToken,
+  getGcsConfig,
+  uploadBufferToGcs,
+  setInMemoryServiceAccountKey,
+  setGcsBucket,
+  setGcsProjectId,
+} from './server/gcpAuth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,7 +45,7 @@ const ALLOWED_CATEGORIES = ['AIBT', 'AIBT-I', 'AVTA', 'NPA', 'BIC', 'REACH', 'HJ
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-PDF-API-Key, ngrok-skip-browser-warning, x-gcs-token');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-PDF-API-Key, ngrok-skip-browser-warning, x-gcs-token, x-gcs-sa-key');
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
@@ -44,21 +55,6 @@ app.use((req, res, next) => {
 // JSON and URL-encoded body parser
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// Helper: Get Google Access Token for GCS
-// Supports an explicitly supplied token (x-gcs-token header / customToken) or the
-// GCS_ACCESS_TOKEN environment variable. Service-account credential fallbacks
-// (GCS_SERVICE_ACCOUNT_JSON / GOOGLE_APPLICATION_CREDENTIALS) are not supported;
-// GCS endpoints report `credentials_needed` when no token is available.
-async function getGoogleAccessToken(explicitToken) {
-  if (explicitToken && explicitToken.trim()) {
-    return explicitToken.trim();
-  }
-  if (process.env.GCS_ACCESS_TOKEN) {
-    return process.env.GCS_ACCESS_TOKEN.trim();
-  }
-  return null;
-}
 
 // Health check
 app.get(['/health', '/api/health'], (req, res) => {
@@ -220,41 +216,48 @@ app.all(['/api/generate-pdf', '/api/generate-pdf/'], async (req, res) => {
       }
     }
 
-    // If WordPress forms URL is known and entry is valid, also push to WordPress REST and trigger email
-    // Use source connection from mapping record for multi-source architecture
-    let wpFormsUrl = "";
-    let apiKey = "";
+    // Store in Cloud (Google Cloud Storage) replacing legacy WordPress push & email
+    const explicitToken = req.headers['x-gcs-token'] || payload.customToken || '';
+    const serviceAccountKey = req.headers['x-gcs-sa-key'] || payload.serviceAccountKey || null;
+    if (payload.bucket) setGcsBucket(payload.bucket);
+    if (payload.projectId) setGcsProjectId(payload.projectId);
+    if (serviceAccountKey) setInMemoryServiceAccountKey(serviceAccountKey);
 
-    const targetTemplateId = mappingData?.templateId || payload.templateId || null;
-    if (targetTemplateId) {
-      const mappingRecords = await listFormMappingRecords(formId, targetTemplateId);
-      if (mappingRecords?.length && mappingRecords[0].sourceConnectionId) {
-        const conn = await getSourceConnection(mappingRecords[0].sourceConnectionId);
-        if (conn) {
-          wpFormsUrl = conn.url || "";
-          const dbApiKey = await getSourceConnectionApiKey(mappingRecords[0].sourceConnectionId);
-          if (dbApiKey) apiKey = dbApiKey;
-        }
-      }
-    }
-    if (wpFormsUrl && entryId && entryId !== '0') {
-      try {
-        const rawBase = wpFormsUrl.replace(/\/$/, "");
-        const restBase = rawBase.endsWith("/forms") ? rawBase.replace(/\/forms$/, "") : (rawBase.includes("/wp-json") ? rawBase : `${rawBase}/wp-json/pdf-generator/v1`);
-        const uploadUrl = `${restBase}/entries/${entryId}/pdf?send_notification=1`;
-        const headers = { 'Content-Type': 'application/pdf', 'ngrok-skip-browser-warning': '1' };
-        if (apiKey) headers['X-PDF-API-Key'] = apiKey;
+    const gcsConfig = getGcsConfig(payload.bucket, payload.projectId);
+    const gcsObjectPath = `${gcsConfig.generatedPath}/${filename}`;
+    const gcsUri = `gs://${gcsConfig.bucket}/${gcsObjectPath}`;
+    const publicUrl = `https://storage.googleapis.com/${gcsConfig.bucket}/${gcsObjectPath}`;
+    const consoleUrl = `https://console.cloud.google.com/storage/browser/${gcsConfig.bucket}/${gcsConfig.generatedPath}?project=${gcsConfig.projectId}`;
 
-        console.log(`[Server] Pushing PDF to WordPress REST: ${uploadUrl}`);
-        const wpRes = await fetch(uploadUrl, { method: 'POST', headers, body: pdfBuffer });
-        if (wpRes.ok) {
-          console.log(`[Server] WordPress accepted PDF and dispatched email notifications successfully!`);
+    let cloudStored = false;
+    let cloudMessage = `Saved locally in generated/ folder`;
+    let gcsData = null;
+
+    try {
+      const token = await getGoogleAccessToken(explicitToken, serviceAccountKey);
+      if (token) {
+        const uploadResult = await uploadBufferToGcs({
+          bucket: gcsConfig.bucket,
+          objectPath: gcsObjectPath,
+          buffer: pdfBuffer,
+          contentType: 'application/pdf',
+          token,
+        });
+        if (uploadResult.ok) {
+          cloudStored = true;
+          cloudMessage = `Stored in Google Cloud Storage at ${gcsUri}`;
+          gcsData = uploadResult.data;
+          console.log(`[Server] Automatically stored generated PDF in Cloud: ${gcsUri}`);
         } else {
-          console.warn(`[Server] WordPress upload returned status: ${wpRes.status}`);
+          console.warn(`[Server] Cloud upload returned HTTP ${uploadResult.status}:`, uploadResult.errorText);
+          cloudMessage = `Cloud upload returned HTTP ${uploadResult.status}: ${uploadResult.errorText}`;
         }
-      } catch (pushErr) {
-        console.warn(`[Server] Could not push to WordPress REST endpoint:`, pushErr.message);
+      } else {
+        console.log(`[Server] PDF cached locally at ${filename}. No active GCP credentials for bucket ${gcsConfig.bucket}.`);
       }
+    } catch (cloudErr) {
+      console.warn(`[Server] Cloud storage error:`, cloudErr.message);
+      cloudMessage = `Cloud storage error: ${cloudErr.message}`;
     }
 
     // Check Accept header
@@ -265,6 +268,15 @@ app.all(['/api/generate-pdf', '/api/generate-pdf/'], async (req, res) => {
         filename,
         filledCount: result.filledCount,
         pdfBytesBase64: pdfBuffer.toString('base64'),
+        cloudStored,
+        gcsUri,
+        publicUrl,
+        consoleUrl,
+        targetGcsPath: gcsObjectPath,
+        bucket: gcsConfig.bucket,
+        projectId: gcsConfig.projectId,
+        message: cloudMessage,
+        gcsData,
       });
     }
 
@@ -273,6 +285,8 @@ app.all(['/api/generate-pdf', '/api/generate-pdf/'], async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Length', String(pdfBuffer.length));
     res.setHeader('X-Filled-Fields', String(result.filledCount || 0));
+    res.setHeader('X-Cloud-Stored', cloudStored ? '1' : '0');
+    res.setHeader('X-GCS-URI', gcsUri);
     res.end(pdfBuffer);
   } catch (err) {
     console.error('PDF Generation API error:', err);
@@ -280,197 +294,151 @@ app.all(['/api/generate-pdf', '/api/generate-pdf/'], async (req, res) => {
   }
 });
 
-// API: Push PDF to WordPress (server-side to avoid browser CORS)
+// =========================================================
+// API: Store Generated PDF in Cloud (Google Cloud Storage)
+// =========================================================
+async function processStorePdfInCloud(payload = {}, reqHeaders = {}) {
+  const pdfBytesBase64 = payload.pdfBytesBase64;
+  const formId = String(payload.formId || '1');
+  const entryId = String(payload.entryId || '0');
+  const templateId = String(payload.templateId || 'Template').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const explicitToken = reqHeaders['x-gcs-token'] || payload.customToken || payload.accessToken || '';
+  const serviceAccountKey = reqHeaders['x-gcs-sa-key'] || payload.serviceAccountKey || null;
+  const customFilename = payload.filename ? String(payload.filename).replace(/[^a-zA-Z0-9._-]/g, '_') : null;
+
+  if (payload.bucket) setGcsBucket(payload.bucket);
+  if (payload.projectId) setGcsProjectId(payload.projectId);
+  if (serviceAccountKey) setInMemoryServiceAccountKey(serviceAccountKey);
+
+  if (!pdfBytesBase64) {
+    throw new Error('pdfBytesBase64 is required');
+  }
+
+  const pdfBuffer = Buffer.from(pdfBytesBase64, 'base64');
+  const header = pdfBuffer.subarray(0, 5).toString('ascii');
+  if (header !== '%PDF-') {
+    throw new Error('Invalid PDF data: missing %PDF- header');
+  }
+
+  const filename = customFilename || `Filled_${templateId}_Entry_${entryId}.pdf`;
+
+  // 1. Always save a local copy in generated/
+  const generatedFolder = path.join(__dirname, 'generated');
+  fs.mkdirSync(generatedFolder, { recursive: true });
+  fs.writeFileSync(path.join(generatedFolder, filename), pdfBuffer);
+
+  // Also mirror to public/generated if public exists
+  const publicGenFolder = path.join(__dirname, 'pdf-mapper', 'public', 'generated');
+  try {
+    fs.mkdirSync(publicGenFolder, { recursive: true });
+    fs.writeFileSync(path.join(publicGenFolder, filename), pdfBuffer);
+  } catch {}
+
+  const gcsConfig = getGcsConfig(payload.bucket, payload.projectId);
+  const gcsObjectPath = `${gcsConfig.generatedPath}/${filename}`;
+  const gcsUri = `gs://${gcsConfig.bucket}/${gcsObjectPath}`;
+  const publicUrl = `https://storage.googleapis.com/${gcsConfig.bucket}/${gcsObjectPath}`;
+  const consoleUrl = `https://console.cloud.google.com/storage/browser/${gcsConfig.bucket}/${gcsConfig.generatedPath}?project=${gcsConfig.projectId}`;
+  const localUrl = `/generated/${encodeURIComponent(filename)}`;
+  const gcloudCommand = `gcloud storage cp "${filename}" "${gcsUri}"`;
+
+  // 2. Check for GCP credentials (Service Account JSON or Access Token)
+  const token = await getGoogleAccessToken(explicitToken, serviceAccountKey);
+
+  if (!token) {
+    return {
+      success: true,
+      status: 'credentials_needed',
+      cloudStored: false,
+      pdfStored: true,
+      filename,
+      fileSize: pdfBuffer.length,
+      targetGcsPath: gcsObjectPath,
+      gcsUri,
+      publicUrl,
+      consoleUrl,
+      localUrl,
+      gcloudCommand,
+      bucket: gcsConfig.bucket,
+      projectId: gcsConfig.projectId,
+      message: `PDF generated and cached locally (${filename}). To store directly in Google Cloud Storage, configure your Service Account credentials in the Google Cloud Credentials modal.`,
+    };
+  }
+
+  // 3. Upload to Google Cloud Storage
+  const uploadResult = await uploadBufferToGcs({
+    bucket: gcsConfig.bucket,
+    objectPath: gcsObjectPath,
+    buffer: pdfBuffer,
+    contentType: 'application/pdf',
+    token,
+  });
+
+  if (uploadResult.ok) {
+    console.log(`[Server] Stored PDF in Google Cloud Storage: ${gcsUri}`);
+    return {
+      success: true,
+      status: 'uploaded',
+      cloudStored: true,
+      pdfStored: true,
+      filename,
+      fileSize: pdfBuffer.length,
+      targetGcsPath: gcsObjectPath,
+      gcsUri,
+      publicUrl,
+      consoleUrl,
+      localUrl,
+      gcsData: uploadResult.data,
+      bucket: gcsConfig.bucket,
+      projectId: gcsConfig.projectId,
+      message: `PDF successfully stored in Google Cloud Storage at ${gcsUri}`,
+    };
+  } else {
+    console.warn(`[Server] GCS upload returned HTTP ${uploadResult.status}:`, uploadResult.errorText);
+    return {
+      success: true,
+      status: 'upload_failed',
+      cloudStored: false,
+      pdfStored: true,
+      filename,
+      fileSize: pdfBuffer.length,
+      targetGcsPath: gcsObjectPath,
+      gcsUri,
+      publicUrl,
+      consoleUrl,
+      localUrl,
+      gcloudCommand,
+      bucket: gcsConfig.bucket,
+      projectId: gcsConfig.projectId,
+      error: `Google Cloud Storage upload returned HTTP ${uploadResult.status}`,
+      message: `PDF generated and saved locally. Cloud upload failed (${uploadResult.status}): ${uploadResult.errorText}`,
+    };
+  }
+}
+
+app.post('/api/store-pdf-in-cloud', async (req, res) => {
+  try {
+    const result = await processStorePdfInCloud(req.body || {}, req.headers);
+    res.json(result);
+  } catch (err) {
+    console.error('[Server] Store PDF in Cloud error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Replaced /api/push-pdf-to-wp feature with Store in Cloud
 app.post('/api/push-pdf-to-wp', async (req, res) => {
   try {
-    const payload = req.body || {};
-    const pdfBytesBase64 = payload.pdfBytesBase64;
-    const formId = String(payload.formId || '1');
-    const entryId = String(payload.entryId || '0');
-    const templateId = payload.templateId || null;
-    const sourceConnectionId = payload.sourceConnectionId || null;
-    const sendNotification = payload.sendNotification !== false; // default true
-
-    if (!pdfBytesBase64) {
-      return res.status(400).json({ error: 'pdfBytesBase64 is required' });
-    }
-    if (!entryId || entryId === '0') {
-      return res.status(400).json({ error: 'entryId is required' });
-    }
-
-    // Load source connection to get WordPress URL
-    let wpFormsUrl = "";
-    let apiKey = "";
-
-    if (sourceConnectionId) {
-      const conn = await getSourceConnection(sourceConnectionId);
-      if (conn) {
-        wpFormsUrl = conn.url || "";
-        // Use DB-backed encrypted API key
-        const dbApiKey = await getSourceConnectionApiKey(sourceConnectionId);
-        if (dbApiKey) {
-          apiKey = dbApiKey;
-        }
-      }
-    } else if (templateId) {
-      // Fallback: try to find sourceConnectionId from the mapping record
-      const mappingRecords = await listFormMappingRecords(formId, templateId);
-      if (mappingRecords?.length && mappingRecords[0].sourceConnectionId) {
-        const conn = await getSourceConnection(mappingRecords[0].sourceConnectionId);
-        if (conn) {
-          wpFormsUrl = conn.url || wpFormsUrl;
-          const dbApiKey = await getSourceConnectionApiKey(mappingRecords[0].sourceConnectionId);
-          if (dbApiKey) {
-            apiKey = dbApiKey;
-          }
-        }
-      }
-    }
-
-    if (!wpFormsUrl) {
-      return res.status(400).json({ error: 'No WordPress URL configured for this source connection' });
-    }
-
-    // Check if API key is available for the selected source
-    if (!apiKey) {
-      // If we got here without a DB-backed key, it's not configured
-      if (sourceConnectionId) {
-        return res.status(400).json({
-          error: 'API key not configured for this source connection',
-          errorType: 'api_key_not_configured',
-        });
-      }
-    }
-
-    const pdfBuffer = Buffer.from(pdfBytesBase64, 'base64');
-
-    // Validate PDF header
-    const header = pdfBuffer.subarray(0, 5).toString('ascii');
-    if (header !== '%PDF-') {
-      return res.status(400).json({
-        error: 'Invalid PDF data: missing %PDF- header',
-        receivedHeader: header,
-      });
-    }
-
-    const rawBase = wpFormsUrl.replace(/\/$/, '');
-    const restBase = rawBase.endsWith('/forms')
-      ? rawBase.replace(/\/forms$/, '')
-      : rawBase.includes('/wp-json')
-        ? rawBase
-        : `${rawBase}/wp-json/pdf-generator/v1`;
-    const uploadUrl = `${restBase}/entries/${entryId}/pdf?send_notification=${sendNotification ? '1' : '0'}`;
-
-    const headers = { 'Content-Type': 'application/pdf', 'ngrok-skip-browser-warning': '1' };
-    if (apiKey) headers['X-PDF-API-Key'] = apiKey;
-
-    console.log(`[Server] Pushing PDF to WordPress REST: ${uploadUrl}`);
-    const wpRes = await fetch(uploadUrl, { method: 'POST', headers, body: pdfBuffer });
-
-    const responseText = await wpRes.text();
-    const contentType = wpRes.headers.get('content-type') || '';
-    const isJson = contentType.includes('application/json');
-
-    if (!wpRes.ok) {
-      console.warn(`[Server] WordPress upload returned status: ${wpRes.status}, content-type: ${contentType}`);
-
-      // Parse WordPress error if JSON
-      let wpError = null;
-      let errorCode = null;
-      if (isJson) {
-        try {
-          wpError = JSON.parse(responseText);
-          errorCode = wpError.code || null;
-        } catch {}
-      }
-
-      // Map WordPress status codes to user-friendly messages
-      let userMessage = 'WordPress could not process the PDF.';
-      let errorType = 'unknown_error';
-
-      if (wpRes.status === 401) {
-        userMessage = 'WordPress authentication failed. Check the API key for the selected source connection.';
-        errorType = 'auth_failed';
-      } else if (wpRes.status === 403) {
-        userMessage = 'WordPress rejected the request because the API user/API key does not have permission.';
-        errorType = 'permission_denied';
-      } else if (wpRes.status === 404) {
-        userMessage = 'PDF Generator REST endpoint was not found on WordPress. Check that the plugin is active.';
-        errorType = 'endpoint_not_found';
-      } else if (wpRes.status === 400) {
-        if (errorCode === 'invalid_pdf_data') {
-          userMessage = 'WordPress rejected the generated PDF because the uploaded PDF data is invalid.';
-          errorType = 'invalid_pdf';
-        } else {
-          userMessage = 'WordPress rejected the PDF because the PDF data is invalid or incomplete.';
-          errorType = 'bad_request';
-        }
-      } else if (wpRes.status === 500 || wpRes.status === 502 || wpRes.status === 503) {
-        if (errorCode === 'pdf_write_failed' || errorCode === 'directory_create_failed' || errorCode === 'directory_not_writable') {
-          userMessage = 'PDF generation succeeded, but WordPress could not write the PDF to disk.';
-          errorType = 'storage_failed';
-        } else if (errorCode === 'gravity_forms_unavailable') {
-          userMessage = 'Gravity Forms is not available on the WordPress site.';
-          errorType = 'gf_unavailable';
-        } else {
-          userMessage = 'WordPress received the PDF but could not store it on the server.';
-          errorType = 'server_error';
-        }
-      }
-
-      return res.status(502).json({
-        error: userMessage,
-        errorType,
-        wordpressStatus: wpRes.status,
-        wordpressErrorCode: errorCode,
-        contentType,
-        responsePreview: responseText.substring(0, 500),
-      });
-    }
-
-    let json;
-    try {
-      json = isJson ? JSON.parse(responseText) : { rawResponse: responseText };
-    } catch (parseErr) {
-      console.warn(`[Server] Failed to parse WordPress response as JSON: ${parseErr.message}`);
-      return res.status(502).json({
-        error: 'WordPress returned a non-JSON response',
-        errorType: 'non_json_response',
-        wordpressStatus: wpRes.status,
-        contentType,
-        responsePreview: responseText.substring(0, 500),
-      });
-    }
-
-    // Verify WordPress explicitly confirmed PDF storage
-    const pdfStored = json.pdf_stored === true;
-    const notificationSent = json.notification_sent === true;
-    const notificationRequested = json.notification_requested === true;
-    const notificationError = json.notification_error || null;
-
-    if (!pdfStored) {
-      console.warn(`[Server] WordPress did not confirm PDF storage:`, json);
-      return res.status(502).json({
-        error: 'WordPress did not confirm the PDF was stored.',
-        errorType: 'storage_not_confirmed',
-        wordpressStatus: wpRes.status,
-        wordpressResponse: json,
-      });
-    }
-
-    console.log(`[Server] WordPress accepted PDF (stored: ${pdfStored}, notification: ${notificationSent})`);
+    const result = await processStorePdfInCloud(req.body || {}, req.headers);
     res.json({
-      success: true,
-      pdfStored: pdfStored,
-      filename: json.filename,
-      fileSize: json.file_size,
-      notificationRequested,
-      notificationSent,
-      notificationError,
+      ...result,
+      notificationRequested: false,
+      notificationSent: false,
+      message: result.message || 'PDF stored in Google Cloud Storage successfully.',
     });
   } catch (err) {
-    console.error('[Server] Push PDF to WordPress error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('[Server] Store in Cloud error:', err);
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -561,8 +529,28 @@ app.get('/api/template-records', async (req, res) => {
 });
 
 app.post('/api/template-records', async (req, res) => {
-  const saved = await upsertPdfTemplateRecord(req.body || {});
-  res.json({ success: true, databasePersisted: saved });
+  try {
+    const payload = req.body || {};
+    const templateId = String(payload.templateId || payload.id || '').trim();
+    if (!templateId) {
+      return res.status(400).json({ error: 'Missing templateId in request body' });
+    }
+    const saved = await upsertPdfTemplateRecord(payload);
+    res.json({ success: true, databasePersisted: saved, templateId });
+  } catch (err) {
+    console.error('[Server] Failed to save template record:', err);
+    res.status(500).json({ error: err.message || 'Failed to persist template record' });
+  }
+});
+
+app.delete('/api/template-records/:id', async (req, res) => {
+  try {
+    const deleted = await deletePdfTemplateRecord(req.params.id);
+    res.json({ success: true, databasePersisted: deleted });
+  } catch (err) {
+    console.error('[Server] Failed to delete template record:', err);
+    res.status(500).json({ error: err.message || 'Failed to delete template record' });
+  }
 });
 
 app.get('/api/mappings', async (req, res) => {
@@ -654,17 +642,61 @@ app.get('/api/registry/download', (req, res) => {
 
 // API: GCS Status
 app.get('/api/gcs-status', (req, res) => {
-  const hasEnvToken = Boolean(process.env.GCS_ACCESS_TOKEN);
-
+  const config = getGcsConfig();
   res.json({
-    bucket: GCS_BUCKET,
-    projectId: GCS_PROJECT_ID,
+    ...config,
     baseFolder: GCS_BASE_PATH,
     allowedCategories: ALLOWED_CATEGORIES,
-    hasEnvCredentials: hasEnvToken,
-    credentialsType: hasEnvToken ? 'access_token' : 'none',
-    consoleUrl: `https://console.cloud.google.com/storage/browser/${GCS_BUCKET}/${GCS_BASE_PATH}?project=${GCS_PROJECT_ID}`,
   });
+});
+
+// API: Validate GCS Credentials
+app.post('/api/gcs-validate', async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const explicitToken = req.headers['x-gcs-token'] || payload.accessToken || '';
+    const serviceAccountKey = req.headers['x-gcs-sa-key'] || payload.serviceAccountKey || null;
+
+    if (payload.bucket) {
+      setGcsBucket(payload.bucket);
+    }
+    if (payload.projectId) {
+      setGcsProjectId(payload.projectId);
+    }
+
+    if (serviceAccountKey) {
+      setInMemoryServiceAccountKey(serviceAccountKey);
+    }
+
+    const token = await getGoogleAccessToken(explicitToken, serviceAccountKey);
+    const gcsConfig = getGcsConfig(payload.bucket, payload.projectId);
+
+    if (token) {
+      return res.json({
+        ok: true,
+        authenticated: true,
+        bucket: gcsConfig.bucket,
+        projectId: gcsConfig.projectId,
+        credentialsType: serviceAccountKey ? 'service_account' : (explicitToken ? 'access_token' : gcsConfig.credentialsType),
+        message: `Authentication successful! Connected to Google Cloud Storage bucket ${gcsConfig.bucket} (Project: ${gcsConfig.projectId}).`,
+      });
+    }
+
+    return res.json({
+      ok: false,
+      authenticated: false,
+      bucket: gcsConfig.bucket,
+      projectId: gcsConfig.projectId,
+      message: `No active credentials detected for bucket ${gcsConfig.bucket}. Please paste a Service Account JSON key or Access Token.`,
+    });
+  } catch (err) {
+    return res.json({
+      ok: false,
+      authenticated: false,
+      error: err.message,
+      message: `Validation failed: ${err.message}`,
+    });
+  }
 });
 
 // API: GCS Upload
@@ -692,7 +724,8 @@ app.post('/api/gcs-upload', async (req, res) => {
     const gcloudCommand = `gcloud storage cp "${filename}" "${gcsUri}"`;
 
     const explicitToken = req.headers['x-gcs-token'] || payload.customToken || '';
-    const token = await getGoogleAccessToken(explicitToken);
+    const serviceAccountKey = req.headers['x-gcs-sa-key'] || payload.serviceAccountKey || null;
+    const token = await getGoogleAccessToken(explicitToken, serviceAccountKey);
 
     if (!token) {
       return res.json({
@@ -858,6 +891,11 @@ app.all('/api/wp-proxy', async (req, res) => {
   }
 });
 
+// Serve local generated PDF directory
+app.use('/generated', express.static(path.join(__dirname, 'generated')));
+app.use('/templates', express.static(path.join(__dirname, 'pdf-mapper', 'public', 'templates')));
+app.use('/templates', express.static(path.join(__dirname, 'pdf-mapper', 'dist', 'templates')));
+
 // Serve frontend static build files or Vite middleware
 const distPath = path.join(__dirname, 'pdf-mapper', 'dist');
 
@@ -880,9 +918,19 @@ if (process.env.NODE_ENV !== 'production' && !fs.existsSync(distPath)) {
 
 if (!viteMiddlewareMounted && fs.existsSync(distPath)) {
   app.use(express.static(distPath));
-  // Wildcard SPA fallback for GET requests
+  // Wildcard SPA fallback for GET requests (exclude static assets and API routes)
   app.use((req, res, next) => {
-    if (req.method === 'GET' && !req.path.startsWith('/api/')) {
+    if (
+      req.method === 'GET' &&
+      !req.path.startsWith('/api/') &&
+      !req.path.startsWith('/templates/') &&
+      !req.path.startsWith('/generated/') &&
+      !req.path.endsWith('.pdf') &&
+      !req.path.endsWith('.json') &&
+      !req.path.endsWith('.mjs') &&
+      !req.path.endsWith('.js') &&
+      !req.path.endsWith('.css')
+    ) {
       return res.sendFile(path.join(distPath, 'index.html'));
     }
     next();

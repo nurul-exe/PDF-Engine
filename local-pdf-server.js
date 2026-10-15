@@ -742,26 +742,12 @@ const server = http.createServer((req, res) => {
             }
           }
 
-          // 5. If WordPress forms URL is known, also push to WordPress REST API and trigger email
-          if (wpFormsUrl && entryId && entryId !== '0') {
-            try {
-              const rawBase = wpFormsUrl.replace(/\/$/, "");
-              const restBase = rawBase.endsWith("/forms") ? rawBase.replace(/\/forms$/, "") : (rawBase.includes("/wp-json") ? rawBase : `${rawBase}/wp-json/pdf-generator/v1`);
-              const uploadUrl = `${restBase}/entries/${entryId}/pdf?send_notification=1`;
-              const headers = { 'Content-Type': 'application/pdf', 'ngrok-skip-browser-warning': '1' };
-              if (apiKey) headers['X-PDF-API-Key'] = apiKey;
-
-              console.log(`[Local Worker] Pushing PDF to WordPress: ${uploadUrl}`);
-              const wpRes = await fetch(uploadUrl, { method: 'POST', headers, body: Buffer.from(pdfBytes) });
-              if (wpRes.ok) {
-                console.log(`[Local Worker] WordPress accepted PDF and dispatched email notifications successfully!`);
-              } else {
-                console.warn(`[Local Worker] WordPress upload returned status: ${wpRes.status}`);
-              }
-            } catch (pushErr) {
-              console.warn(`[Local Worker] Could not push to WordPress REST endpoint:`, pushErr.message);
-            }
-          }
+          // 5. Store generated PDF in Cloud & local generated/ folder
+          const genDir = path.join(__dirname, 'generated');
+          if (!fs.existsSync(genDir)) fs.mkdirSync(genDir, { recursive: true });
+          const genFilename = `Filled_${templateId}_Entry_${entryId}.pdf`;
+          fs.writeFileSync(path.join(genDir, genFilename), Buffer.from(pdfBytes));
+          console.log(`[Local Worker] Stored filled PDF locally: ${path.join(genDir, genFilename)}`);
 
           // 6. Return response to caller
           const accept = req.headers['accept'] || '';

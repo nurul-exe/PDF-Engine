@@ -3,7 +3,7 @@ import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
 import { Eye, EyeOff, X } from "lucide-react";
 import { humanizePdfFieldName } from "./mappingUtils";
-import { fetchPdfBytes } from "./connectionManager";
+import { fetchPdfBytes, isPdfBuffer } from "./connectionManager";
 import "./PdfViewer.css";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -18,7 +18,7 @@ function pdfFieldType(field) {
 
 function PdfFieldOverlay({
     field,
-    pageSize,
+    pageSize = { width: 612, height: 792 },
     mappingInfo,
     activeSource,
     isSelected,
@@ -26,8 +26,10 @@ function PdfFieldOverlay({
     onEdit,
     onRemove,
 }) {
-    const xScale = 100 / pageSize.width;
-    const yScale = 100 / pageSize.height;
+    const safeWidth = pageSize?.width || 612;
+    const safeHeight = pageSize?.height || 792;
+    const xScale = 100 / safeWidth;
+    const yScale = 100 / safeHeight;
     const isMapped = Boolean(mappingInfo);
     const isTarget = Boolean(activeSource);
     const displayLabel = humanizePdfFieldName(field.name);
@@ -106,54 +108,103 @@ function PdfPage({
     const canvasRef = useRef(null);
     const pageFrameRef = useRef(null);
     const pageSurfaceRef = useRef(null);
+    const activeRenderTaskRef = useRef(null);
 
     useEffect(() => {
-        let cancelled = false;
-        let renderTask;
-        let rendering = false;
+        let isMounted = true;
 
         async function renderPage() {
-            if (rendering) return;
-            rendering = true;
+            if (!pdf || !pageNumber || !isMounted) return;
+            if (!pageFrameRef.current || !canvasRef.current || !pageSurfaceRef.current) return;
+
+            // Cancel any previous in-flight render task
+            if (activeRenderTaskRef.current) {
+                try {
+                    activeRenderTaskRef.current.cancel();
+                } catch {
+                    // Ignore cancellation
+                }
+                activeRenderTaskRef.current = null;
+            }
+
             try {
                 const page = await pdf.getPage(pageNumber);
-                if (cancelled || !pageFrameRef.current || !canvasRef.current || !pageSurfaceRef.current) return;
+                if (!isMounted || !pageFrameRef.current || !canvasRef.current || !pageSurfaceRef.current) return;
+
                 const availableWidth = Math.max(pageFrameRef.current.clientWidth - 32, 280);
                 const baseViewport = page.getViewport({ scale: 1 });
-                const scale = availableWidth / baseViewport.width;
+                const scale = availableWidth / (baseViewport.width || 1);
                 const viewport = page.getViewport({ scale });
                 const canvas = canvasRef.current;
                 const surface = pageSurfaceRef.current;
                 const deviceScale = window.devicePixelRatio || 1;
+
                 canvas.width = Math.floor(viewport.width * deviceScale);
                 canvas.height = Math.floor(viewport.height * deviceScale);
                 canvas.style.width = `${viewport.width}px`;
                 canvas.style.height = `${viewport.height}px`;
                 surface.style.width = `${viewport.width}px`;
                 surface.style.height = `${viewport.height}px`;
-                renderTask = page.render({
-                    canvasContext: canvas.getContext("2d"),
+
+                const ctx = canvas.getContext("2d");
+                if (!ctx) return;
+
+                const renderContext = {
+                    canvasContext: ctx,
                     viewport,
                     transform: deviceScale === 1 ? null : [deviceScale, 0, 0, deviceScale, 0, 0],
-                });
+                };
+
+                const renderTask = page.render(renderContext);
+                activeRenderTaskRef.current = renderTask;
                 await renderTask.promise;
-            } catch (error) {
-                if (!cancelled && error?.name !== "RenderingCancelledException") onError(error);
-            } finally {
-                renderTask = null;
-                rendering = false;
+                activeRenderTaskRef.current = null;
+            } catch (err) {
+                activeRenderTaskRef.current = null;
+                if (!isMounted) return;
+                const isCancellation =
+                    err?.name === "RenderingCancelledException" ||
+                    err?.name === "AbortException" ||
+                    String(err?.message || "").toLowerCase().includes("cancel") ||
+                    String(err?.message || "").toLowerCase().includes("multiple render");
+
+                if (!isCancellation) {
+                    console.error("PDF page render error:", err);
+                    onError?.(err);
+                }
             }
         }
 
         renderPage();
-        const resizeObserver = new ResizeObserver(renderPage);
-        if (pageFrameRef.current) resizeObserver.observe(pageFrameRef.current);
+
+        let resizeTimer = null;
+        const resizeObserver = new ResizeObserver(() => {
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                if (isMounted) renderPage();
+            }, 80);
+        });
+
+        if (pageFrameRef.current) {
+            resizeObserver.observe(pageFrameRef.current);
+        }
+
         return () => {
-            cancelled = true;
+            isMounted = false;
+            if (resizeTimer) clearTimeout(resizeTimer);
             resizeObserver.disconnect();
-            renderTask?.cancel();
+            if (activeRenderTaskRef.current) {
+                try {
+                    activeRenderTaskRef.current.cancel();
+                } catch {
+                    // Ignore cancellation
+                }
+                activeRenderTaskRef.current = null;
+            }
         };
     }, [pdf, pageNumber, onError]);
+
+    const pageSize = pageData?.size || { width: 612, height: 792 };
 
     return (
         <div className="pdf-page-frame" ref={pageFrameRef}>
@@ -167,7 +218,7 @@ function PdfPage({
                             <PdfFieldOverlay
                                 key={field.name}
                                 field={{ ...field, page: pageNumber }}
-                                pageSize={pageData.size}
+                                pageSize={pageSize}
                                 mappingInfo={mappedDetailsByPdf[field.name]}
                                 activeSource={activeSource}
                                 isSelected={selectedField?.name === field.name}
@@ -229,10 +280,10 @@ export default function PdfViewer({
                     return;
                 }
 
-                if (typeof source === "string") {
+                if (typeof source === "string" || (source && typeof source === "object")) {
                     const result = await fetchPdfBytes(source);
                     if (cancelled) return;
-                    if (result?.bytes) {
+                    if (result?.bytes && isPdfBuffer(result.bytes)) {
                         const task = pdfjsLib.getDocument({ data: result.bytes });
                         const doc = await task.promise;
                         if (!cancelled) {
@@ -244,14 +295,24 @@ export default function PdfViewer({
                         return;
                     }
 
-                    // Fallback to direct URL if fetchPdfBytes returned null
-                    const task = pdfjsLib.getDocument({ url: source });
-                    const doc = await task.promise;
+                    // Fallback to direct URL if source is string
+                    if (typeof source === "string") {
+                        const proxyUrl = (source.startsWith("http://") || source.startsWith("https://")) && typeof window !== "undefined" && !source.includes(window.location.host)
+                            ? `/api/wp-proxy?url=${encodeURIComponent(source)}`
+                            : source;
+                        const task = pdfjsLib.getDocument({ url: proxyUrl });
+                        const doc = await task.promise;
+                        if (!cancelled) {
+                            setPdf(doc);
+                            setLoadedSource(source);
+                            setPageNumber(1);
+                            setError("");
+                        }
+                        return;
+                    }
+
                     if (!cancelled) {
-                        setPdf(doc);
-                        setLoadedSource(source);
-                        setPageNumber(1);
-                        setError("");
+                        setError("Could not resolve valid PDF bytes for template.");
                     }
                 }
             } catch (err) {

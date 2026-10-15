@@ -376,6 +376,16 @@
     color: #e8db8b;
 }
 
+.nav-status-pill.is-warning {
+    background: #2b230f;
+    border-color: #695622;
+    color: #f7d49f;
+}
+
+.is-warning .status-indicator-dot {
+    background: #f59e0b;
+}
+
 .status-indicator-dot {
     width: 7px;
     height: 7px;

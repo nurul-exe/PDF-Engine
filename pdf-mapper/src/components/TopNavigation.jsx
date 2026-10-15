@@ -10,6 +10,7 @@ import {
     Layers,
     Send,
     Database,
+    Cloud,
 } from "lucide-react";
 import "./TopNavigation.css";
 
@@ -38,6 +39,8 @@ export default function TopNavigation({
     dbStatus,
     onCheckDb,
     onOpenDbConfig,
+    gcsStatus,
+    onOpenGcsModal,
 }) {
     const [isChecking, setIsChecking] = useState(false);
 
@@ -379,6 +382,37 @@ export default function TopNavigation({
                             title="Configure Database"
                         >
                             <Settings size={12} /> Config
+                        </button>
+                    </div>
+                </div>
+
+                {/* Cloud Storage: GCP Credentials & Target */}
+                <div className="nav-selector-cluster cluster-gcs">
+                    <div className="cluster-header-row">
+                        <span className="cluster-eyebrow">
+                            <Cloud size={12} style={{ display: "inline-block", marginRight: "4px", verticalAlign: "middle" }} />
+                            Cloud Storage
+                        </span>
+                    </div>
+
+                    <div className="selector-group">
+                        <div
+                            className={`nav-status-pill ${gcsStatus?.hasEnvCredentials || gcsStatus?.authenticated ? "is-ok" : "is-warning"}`}
+                            title={gcsStatus?.hasEnvCredentials || gcsStatus?.authenticated ? `Active bucket: gs://${gcsStatus.bucket || "cdn.vconsultancy.com.au"}` : "No active GCP credentials configured"}
+                        >
+                            <span className="status-indicator-dot" />
+                            <span className="status-text">
+                                {gcsStatus?.hasEnvCredentials || gcsStatus?.authenticated ? "GCP Ready" : "Local Cache"}
+                            </span>
+                        </div>
+
+                        <button
+                            type="button"
+                            className="nav-action-btn"
+                            onClick={onOpenGcsModal}
+                            title="Configure Google Cloud Storage Service Account"
+                        >
+                            <Cloud size={12} /> GCP Keys
                         </button>
                     </div>
                 </div>

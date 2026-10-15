@@ -170,21 +170,127 @@ function templateMetadata(record) {
   return metadata;
 }
 
+function persistTemplateToRegistryFile(record) {
+  try {
+    const registryPath = path.join(rootDir, 'sources-and-templates.json');
+    const publicPath = path.join(rootDir, 'pdf-mapper', 'public', 'sources-and-templates.json');
+    const distPath = path.join(rootDir, 'pdf-mapper', 'dist', 'sources-and-templates.json');
+    let data = { version: 1, pdfTemplates: [], gravityFormSources: [] };
+    if (fsSync.existsSync(registryPath)) {
+      try {
+        data = JSON.parse(fsSync.readFileSync(registryPath, 'utf8'));
+      } catch {}
+    }
+    if (!Array.isArray(data.pdfTemplates)) data.pdfTemplates = [];
+
+    const templateId = String(record.templateId || record.id || '').trim();
+    const meta = record.metadata && typeof record.metadata === 'object' ? record.metadata : {};
+    const name = meta.name || record.filename || record.name || templateId;
+    const filename = record.filename || meta.name || `${templateId}.pdf`;
+    const url = record.url || meta.cdnUrl || meta.sourceUrl || '';
+
+    const item = {
+      id: templateId,
+      name,
+      filename,
+      category: meta.category || 'Others',
+      isBuiltin: Boolean(meta.isBuiltin),
+      url,
+      gcsPath: meta.gcsPath || '',
+      gcsUri: meta.gcsUri || '',
+      cdnUrl: meta.cdnUrl || (url.startsWith('http') ? url : ''),
+      consoleUrl: meta.consoleUrl || '',
+      analysis: record.analysis || null,
+      metadata: meta,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const idx = data.pdfTemplates.findIndex((t) => String(t.id).trim() === templateId);
+    if (idx >= 0) {
+      data.pdfTemplates[idx] = { ...data.pdfTemplates[idx], ...item };
+    } else {
+      data.pdfTemplates.push(item);
+    }
+    data.lastUpdated = new Date().toISOString();
+    const serialized = JSON.stringify(data, null, 2);
+    fsSync.writeFileSync(registryPath, serialized, 'utf8');
+    if (fsSync.existsSync(path.dirname(publicPath))) {
+      fsSync.writeFileSync(publicPath, serialized, 'utf8');
+    }
+    if (fsSync.existsSync(path.dirname(distPath))) {
+      fsSync.writeFileSync(distPath, serialized, 'utf8');
+    }
+  } catch (err) {
+    console.warn('[DB] Could not sync template to sources-and-templates.json:', err.message);
+  }
+}
+
+export async function deletePdfTemplateRecord(templateId) {
+  const id = String(templateId || '').trim();
+  if (!id) return false;
+  memTemplates.delete(id);
+
+  try {
+    const registryPath = path.join(rootDir, 'sources-and-templates.json');
+    const publicPath = path.join(rootDir, 'pdf-mapper', 'public', 'sources-and-templates.json');
+    const distPath = path.join(rootDir, 'pdf-mapper', 'dist', 'sources-and-templates.json');
+    if (fsSync.existsSync(registryPath)) {
+      const data = JSON.parse(fsSync.readFileSync(registryPath, 'utf8'));
+      if (Array.isArray(data.pdfTemplates)) {
+        data.pdfTemplates = data.pdfTemplates.filter((t) => String(t.id).trim() !== id);
+        data.lastUpdated = new Date().toISOString();
+        const serialized = JSON.stringify(data, null, 2);
+        fsSync.writeFileSync(registryPath, serialized, 'utf8');
+        if (fsSync.existsSync(path.dirname(publicPath))) {
+          fsSync.writeFileSync(publicPath, serialized, 'utf8');
+        }
+        if (fsSync.existsSync(path.dirname(distPath))) {
+          fsSync.writeFileSync(distPath, serialized, 'utf8');
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[DB] Could not remove template from sources-and-templates.json:', err.message);
+  }
+
+  try {
+    const result = await queryRuntime(`DELETE FROM pdf_templates WHERE id = $1`, [id]);
+    if (result) return true;
+  } catch (err) {
+    console.warn('[DB] Error deleting from PostgreSQL pdf_templates:', err.message);
+  }
+  return true;
+}
+
 export async function upsertPdfTemplateRecord(record = {}) {
   const templateId = String(record.templateId || record.id || '').trim();
   if (!templateId) return false;
 
   // Always update in-memory cache
   const existing = memTemplates.get(templateId) || {};
+  const meta = { ...(existing.metadata_json || {}), ...templateMetadata(record) };
+  const targetUrl = persistableUrl(record) || existing.pdf_template_url || null;
+  const analysisObj = record.analysis && typeof record.analysis === 'object' ? record.analysis : (existing.analysis_json || null);
+
   memTemplates.set(templateId, {
     ...existing,
     id: templateId,
     filename: String(record.filename || existing.filename || ''),
-    pdf_template_url: persistableUrl(record) || existing.pdf_template_url || null,
-    analysis_json: record.analysis && typeof record.analysis === 'object' ? record.analysis : (existing.analysis_json || null),
-    metadata_json: { ...(existing.metadata_json || {}), ...templateMetadata(record) },
+    pdf_template_url: targetUrl,
+    analysis_json: analysisObj,
+    metadata_json: meta,
     updated_at: new Date().toISOString(),
     created_at: existing.created_at || new Date().toISOString(),
+  });
+
+  // Sync to disk file sources-and-templates.json
+  persistTemplateToRegistryFile({
+    id: templateId,
+    templateId,
+    filename: String(record.filename || existing.filename || ''),
+    url: targetUrl,
+    analysis: analysisObj,
+    metadata: meta,
   });
 
   try {
@@ -199,15 +305,15 @@ export async function upsertPdfTemplateRecord(record = {}) {
          updated_at = now()`,
       [
         templateId,
-        String(record.filename || ''),
-        persistableUrl(record),
-        record.analysis && typeof record.analysis === 'object' ? record.analysis : null,
-        templateMetadata(record),
+        String(record.filename || existing.filename || ''),
+        targetUrl,
+        analysisObj ? JSON.stringify(analysisObj) : null,
+        JSON.stringify(meta || {}),
       ],
     );
     if (result) return true;
   } catch (err) {
-    console.warn('[DB] Falling back to in-memory store for upsertPdfTemplateRecord:', err.message);
+    console.warn('[DB] Falling back to in-memory/file store for upsertPdfTemplateRecord:', err.message);
   }
 
   return true;

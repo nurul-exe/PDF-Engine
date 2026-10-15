@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import {
     X,
     Zap,
-    Send,
+    Cloud,
     Download,
     ExternalLink,
     Paperclip,
@@ -12,9 +12,9 @@ import {
 import "./PdfGenerationTester.css";
 import { generateFilledPdf, extractUploadedFilesFromEntry } from "./pdfGenerator";
 import { fetchFormSubmissions } from "./submissionService";
-import { fetchPdfBytes } from "./connectionManager";
-import { normalizeWpFormsUrl } from "./mappingUtils";
+import { fetchPdfBytes, storePdfInCloud } from "./connectionManager";
 import AsyncProgressBar from "./components/AsyncProgressBar";
+import GoogleCloudCredentialsModal from "./components/GoogleCloudCredentialsModal";
 
 export default function PdfGenerationTester({
     isOpen,
@@ -26,26 +26,17 @@ export default function PdfGenerationTester({
     wordpressFormsUrl,
     sourceConnectionId,
 }) {
-    // Chunked Uint8Array to base64 conversion to avoid Maximum call stack size exceeded
-    function uint8ArrayToBase64(bytes) {
-        let binary = '';
-        const chunkSize = 0x8000;
-        const view = new Uint8Array(bytes);
-        for (let i = 0; i < view.length; i += chunkSize) {
-            binary += String.fromCharCode(...view.subarray(i, i + chunkSize));
-        }
-        return btoa(binary);
-    }
     const [submissions, setSubmissions] = useState([]);
     const [selectedSubmissionId, setSelectedSubmissionId] = useState("");
     const [currentEntry, setCurrentEntry] = useState(null);
     const [submissionSource, setSubmissionSource] = useState({ source: "loading", message: "" });
     const [activeTab, setActiveTab] = useState("preview"); // "preview" | "audit" | "json"
     const [isGenerating, setIsGenerating] = useState(false);
-    const [isPushingToWp, setIsPushingToWp] = useState(false);
+    const [isStoringInCloud, setIsStoringInCloud] = useState(false);
     const [generationResult, setGenerationResult] = useState(null);
     const [error, setError] = useState("");
-    const [pushNotice, setPushNotice] = useState("");
+    const [cloudNotice, setCloudNotice] = useState(null);
+    const [isGcsModalOpen, setIsGcsModalOpen] = useState(false);
 
     // Raw JSON editor state
     const [rawJsonText, setRawJsonText] = useState("");
@@ -235,16 +226,16 @@ export default function PdfGenerationTester({
         }
     }, [pdfBytes, currentEntry, mappings, flattenPdf, attachUploadedFiles]);
 
-    // Push PDF to WordPress via server-side endpoint (avoids browser CORS)
-    const handlePushToWpAndEmail = useCallback(async () => {
+    // Store PDF in Google Cloud Storage via server-side endpoint
+    const handleStoreInCloud = useCallback(async () => {
         if (!currentEntry) {
             setError("Please select or enter a form submission.");
             return;
         }
 
-        setIsPushingToWp(true);
+        setIsStoringInCloud(true);
         setError("");
-        setPushNotice("");
+        setCloudNotice(null);
 
         try {
             let bytesToSend = generationResult?.pdfBytes;
@@ -267,84 +258,38 @@ export default function PdfGenerationTester({
             }
 
             const targetEntryId = currentEntry.id || selectedSubmissionId || "1";
-            // Convert Uint8Array PDF bytes to base64 using browser-compatible API (chunked)
-            const pdfBytesBase64 = uint8ArrayToBase64(bytesToSend);
+            const formId = selectedForm?.id || "1";
+            const templateId = selectedTemplate?.templateId || selectedTemplate?.id || "Template";
+            const category = selectedTemplate?.category || "AIBT";
 
-            const pushRes = await fetch('/api/push-pdf-to-wp', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    pdfBytesBase64,
-                    formId: selectedForm?.id || '1',
-                    entryId: targetEntryId,
-                    templateId: selectedTemplate?.templateId || null,
-                    sourceConnectionId,
-                    sendNotification: true,
-                }),
+            const cloudRes = await storePdfInCloud({
+                pdfBytes: bytesToSend,
+                formId,
+                entryId: targetEntryId,
+                templateId,
+                category,
             });
 
-            if (!pushRes.ok) {
-                const errData = await pushRes.json().catch(() => ({}));
-                const errorType = errData.errorType || 'unknown_error';
-                throw new Error(errData.error || `Push failed (${pushRes.status})`);
-            }
-
-            const json = await pushRes.json();
-
-            // Build accurate success message based on actual WordPress response
-            const pdfStored = json.pdfStored === true;
-            const notificationSent = json.notificationSent === true;
-            const notificationError = json.notificationError || null;
-
-            if (!pdfStored) {
-                setError(`PDF generation succeeded, but WordPress could not confirm the PDF was stored.`);
-                return;
-            }
-
-            let pushNoticeMsg = `PDF stored on WordPress: ${json.filename || `form-${selectedForm?.id}-entry-${targetEntryId}.pdf`} (${json.fileSize || 'unknown'} bytes, ${filledCount} fields filled).`;
-            
-            if (json.notificationRequested) {
-                if (notificationSent) {
-                    pushNoticeMsg += ' Email notification dispatched.';
-                } else if (json.notificationError) {
-                    pushNoticeMsg += ` PDF was saved successfully, but the email notification could not be dispatched: ${notificationError}`;
-                } else {
-                    pushNoticeMsg += ' Email notification dispatch attempted.';
-                }
-            }
-
-            setPushNotice(pushNoticeMsg);
+            setCloudNotice({
+                status: cloudRes.status,
+                cloudStored: cloudRes.cloudStored,
+                filename: cloudRes.filename,
+                fileSize: cloudRes.fileSize,
+                filledCount,
+                gcsUri: cloudRes.gcsUri,
+                publicUrl: cloudRes.publicUrl,
+                consoleUrl: cloudRes.consoleUrl,
+                localUrl: cloudRes.localUrl,
+                message: cloudRes.message,
+                gcloudCommand: cloudRes.gcloudCommand,
+            });
         } catch (err) {
-            console.error("Push to WordPress & Email failed:", err);
-
-            // Check if the error has an errorType from the server response
-            const errData = err.message ? {} : {}; // We'll need to extract errorType differently
-            // The error message already contains the user-friendly message from server
-            const errorMessage = err.message || 'Failed to push to WordPress & send email';
-
-            // Provide more context based on common error patterns
-            let detailedError = errorMessage;
-            if (errorMessage.includes('authentication failed') || errorMessage.includes('API key')) {
-                detailedError = 'WordPress authentication failed. Check the API key for the selected source connection.';
-            } else if (errorMessage.includes('permission')) {
-                detailedError = 'WordPress rejected the request because the API user/API key does not have permission.';
-            } else if (errorMessage.includes('endpoint not found') || errorMessage.includes('REST endpoint')) {
-                detailedError = 'PDF Generator REST endpoint was not found on WordPress. Check that the plugin is active.';
-            } else if (errorMessage.includes('could not write') || errorMessage.includes('storage_failed') || errorMessage.includes('disk')) {
-                detailedError = 'PDF generation succeeded, but WordPress could not write the PDF to disk.';
-            } else if (errorMessage.includes('invalid PDF') || errorMessage.includes('rejected the generated PDF')) {
-                detailedError = 'WordPress rejected the generated PDF because the uploaded PDF data is invalid.';
-            } else if (errorMessage.includes('Gravity Forms')) {
-                detailedError = 'Gravity Forms is not available on the WordPress site.';
-            } else if (errorMessage.includes('non-JSON') || errorMessage.includes('non_json')) {
-                detailedError = 'WordPress returned an unexpected response (likely HTML error page). Check plugin status.';
-            }
-
-            setError(detailedError);
+            console.error("Store in Cloud failed:", err);
+            setError(err.message || "Failed to store PDF in cloud");
         } finally {
-            setIsPushingToWp(false);
+            setIsStoringInCloud(false);
         }
-    }, [currentEntry, generationResult, pdfBytes, mappings, flattenPdf, attachUploadedFiles, selectedSubmissionId, selectedForm, selectedTemplate, sourceConnectionId]);
+    }, [currentEntry, generationResult, pdfBytes, mappings, flattenPdf, attachUploadedFiles, selectedSubmissionId, selectedForm, selectedTemplate]);
 
     // Close on ESC
     useEffect(() => {
@@ -393,7 +338,7 @@ export default function PdfGenerationTester({
 
                 <div className="tester-body">
                     <AsyncProgressBar
-                        label={isGenerating ? "Generating PDF..." : isPushingToWp ? "Sending..." : ""}
+                        label={isGenerating ? "Generating PDF..." : isStoringInCloud ? "Storing in Cloud..." : ""}
                     />
                     {/* Left Sidebar: Submission Inspector & Controller */}
                     <aside className="tester-sidebar">
@@ -557,7 +502,7 @@ export default function PdfGenerationTester({
                             type="button"
                             className="generate-btn"
                             onClick={runGeneration}
-                            disabled={isGenerating || isPushingToWp || !pdfBytes || !currentEntry}
+                            disabled={isGenerating || isStoringInCloud || !pdfBytes || !currentEntry}
                             style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
                         >
                             {isGenerating ? (
@@ -575,42 +520,79 @@ export default function PdfGenerationTester({
 
                         <button
                             type="button"
-                            onClick={handlePushToWpAndEmail}
-                            disabled={isGenerating || isPushingToWp || !currentEntry}
+                            onClick={handleStoreInCloud}
+                            disabled={isGenerating || isStoringInCloud || !currentEntry}
                             style={{
                                 marginTop: "8px",
                                 width: "100%",
                                 padding: "10px 14px",
-                                background: "#1d6fa5",
+                                background: "#0f766e",
                                 color: "#ffffff",
                                 border: "none",
                                 borderRadius: "4px",
                                 fontSize: "13px",
                                 fontWeight: "700",
-                                cursor: (isGenerating || isPushingToWp || !currentEntry) ? "not-allowed" : "pointer",
-                                opacity: (isGenerating || isPushingToWp || !currentEntry) ? 0.6 : 1,
+                                cursor: (isGenerating || isStoringInCloud || !currentEntry) ? "not-allowed" : "pointer",
+                                opacity: (isGenerating || isStoringInCloud || !currentEntry) ? 0.6 : 1,
                                 display: "flex",
                                 alignItems: "center",
                                 justifyContent: "center",
                                 gap: "6px",
                             }}
                         >
-                            {isPushingToWp ? (
+                            {isStoringInCloud ? (
                                 <>
                                     <Loader2 size={13} className="animate-spin" />
-                                    <span>Pushing to WP & Sending Email...</span>
+                                    <span>Storing in Cloud...</span>
                                 </>
                             ) : (
                                 <>
-                                    <Send size={13} />
-                                    <span>Push PDF to WP & Email</span>
+                                    <Cloud size={14} />
+                                    <span>Store in Cloud</span>
                                 </>
                             )}
                         </button>
 
-                        {pushNotice && (
-                            <div style={{ padding: "8px 12px", background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "3px", color: "#166534", fontSize: "12px", marginTop: "8px", lineHeight: "1.4" }}>
-                                {pushNotice}
+                        {cloudNotice && (
+                            <div style={{
+                                padding: "10px 12px",
+                                background: cloudNotice.cloudStored ? "#f0fdf4" : "#fefce8",
+                                border: `1px solid ${cloudNotice.cloudStored ? "#bbf7d0" : "#fef08a"}`,
+                                borderRadius: "4px",
+                                color: cloudNotice.cloudStored ? "#166534" : "#854d0e",
+                                fontSize: "12px",
+                                marginTop: "8px",
+                                lineHeight: "1.4"
+                            }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: "700", marginBottom: "4px" }}>
+                                    <Cloud size={14} />
+                                    <span>{cloudNotice.cloudStored ? "Stored in Google Cloud Storage" : "Cached Locally"}</span>
+                                </div>
+                                <div style={{ fontSize: "11px", marginBottom: "6px" }}>{cloudNotice.message}</div>
+                                {cloudNotice.gcsUri && (
+                                    <div style={{ fontFamily: "monospace", fontSize: "10px", background: "rgba(0,0,0,0.05)", padding: "4px 6px", borderRadius: "3px", wordBreak: "break-all", marginBottom: "6px" }}>
+                                        {cloudNotice.gcsUri}
+                                    </div>
+                                )}
+                                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "4px" }}>
+                                    {cloudNotice.consoleUrl && (
+                                        <a
+                                            href={cloudNotice.consoleUrl}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            style={{ color: "#0f766e", fontWeight: "600", textDecoration: "underline", display: "inline-flex", alignItems: "center", gap: "3px", fontSize: "11px" }}
+                                        >
+                                            <ExternalLink size={10} /> Open in Cloud Console
+                                        </a>
+                                    )}
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsGcsModalOpen(true)}
+                                        style={{ background: "none", border: "none", color: "#0f766e", fontWeight: "600", textDecoration: "underline", cursor: "pointer", fontSize: "11px", padding: 0 }}
+                                    >
+                                        ⚙ GCP Credentials
+                                    </button>
+                                </div>
                             </div>
                         )}
 
@@ -694,13 +676,13 @@ export default function PdfGenerationTester({
                                 <div className="tester-actions-group">
                                     <button
                                         type="button"
-                                        onClick={handlePushToWpAndEmail}
-                                        disabled={isPushingToWp}
+                                        onClick={handleStoreInCloud}
+                                        disabled={isStoringInCloud}
                                         className="action-secondary"
-                                        style={{ background: "#1d6fa5", color: "#ffffff", borderColor: "#1d6fa5", fontWeight: "600", cursor: isPushingToWp ? "not-allowed" : "pointer", display: "inline-flex", alignItems: "center", gap: "5px" }}
+                                        style={{ background: "#0f766e", color: "#ffffff", borderColor: "#0f766e", fontWeight: "600", cursor: isStoringInCloud ? "not-allowed" : "pointer", display: "inline-flex", alignItems: "center", gap: "5px" }}
                                     >
-                                        <Send size={12} />
-                                        {isPushingToWp ? "Pushing..." : "Push to WP & Email"}
+                                        <Cloud size={12} />
+                                        {isStoringInCloud ? "Storing in Cloud..." : "Store in Cloud"}
                                     </button>
                                     <a
                                         href={generationResult.blobUrl}
@@ -874,6 +856,13 @@ export default function PdfGenerationTester({
                     </main>
                 </div>
             </div>
+            {isGcsModalOpen && (
+                <GoogleCloudCredentialsModal
+                    isOpen={isGcsModalOpen}
+                    onClose={() => setIsGcsModalOpen(false)}
+                    selectedCategory={selectedTemplate?.category || "AIBT"}
+                />
+            )}
         </div>
     );
 }

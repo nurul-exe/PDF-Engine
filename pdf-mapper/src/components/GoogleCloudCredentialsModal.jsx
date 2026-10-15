@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { Cloud, X, Check, Zap, ExternalLink } from "lucide-react";
+import { useState, useEffect, useMemo } from "react";
+import { Cloud, X, Check, Zap, ExternalLink, ShieldCheck } from "lucide-react";
 import {
     getGcsCredentials,
     saveGcsCredentials,
@@ -17,6 +17,32 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
     const [isTesting, setIsTesting] = useState(false);
     const [copiedCli, setCopiedCli] = useState(false);
     const [activeTab, setActiveTab] = useState("setup"); // "setup" | "cli" | "guide"
+
+    const targetBucket = creds.bucket || GCS_BUCKET;
+    const targetProjectId = creds.projectId || GCS_PROJECT_ID;
+
+    // Detect and parse Service Account credentials JSON
+    const parsedSa = useMemo(() => {
+        if (!creds.serviceAccountKey) return null;
+        try {
+            const parsed = JSON.parse(creds.serviceAccountKey);
+            if (parsed && typeof parsed === "object" && (parsed.client_email || parsed.type === "service_account")) {
+                return parsed;
+            }
+        } catch {
+            try {
+                const b64 = atob(creds.serviceAccountKey.trim());
+                const parsed = JSON.parse(b64);
+                if (parsed && typeof parsed === "object" && (parsed.client_email || parsed.type === "service_account")) {
+                    return parsed;
+                }
+            } catch (err) {
+                // Ignore decoding error
+                void err;
+            }
+        }
+        return null;
+    }, [creds.serviceAccountKey]);
 
     useEffect(() => {
         if (!isOpen) return;
@@ -40,17 +66,31 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
         };
     }, [isOpen]);
 
+    const handleServiceAccountChange = (val) => {
+        const next = { ...creds, serviceAccountKey: val };
+        try {
+            const parsed = JSON.parse(val);
+            if (parsed.project_id && (!creds.projectId || creds.projectId === GCS_PROJECT_ID)) {
+                next.projectId = parsed.project_id;
+            }
+        } catch (err) {
+            // Invalid JSON while typing is expected
+            void err;
+        }
+        setCreds(next);
+    };
+
     const handleSave = () => {
-        saveGcsCredentials(creds);
-        setTestResult({ ok: true, message: "Credentials saved to local storage." });
-        setTimeout(() => setTestResult(null), 3000);
+        const updated = saveGcsCredentials(creds);
+        setTestResult({ ok: true, message: `Credentials saved! Connected to bucket: ${updated.bucket || GCS_BUCKET}` });
+        setTimeout(() => setTestResult(null), 3500);
     };
 
     const handleClear = () => {
-        const cleared = { accessToken: "", serviceAccountKey: "" };
+        const cleared = { accessToken: "", serviceAccountKey: "", bucket: GCS_BUCKET, projectId: GCS_PROJECT_ID };
         saveGcsCredentials(cleared);
         setCreds(cleared);
-        setTestResult({ ok: true, message: "Credentials cleared." });
+        setTestResult({ ok: true, message: "Credentials cleared. Reverted to default bucket." });
         setTimeout(() => setTestResult(null), 3000);
     };
 
@@ -58,28 +98,29 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
         setIsTesting(true);
         setTestResult(null);
         try {
-            // First save current inputs
             saveGcsCredentials(creds);
 
-            const tokenOrKey = creds.accessToken || creds.serviceAccountKey || "";
-            const headers = {};
-            if (tokenOrKey) {
-                headers["x-gcs-token"] = tokenOrKey;
-            }
-
-            // Test status
-            const res = await fetch("/api/gcs-status", { headers });
+            const res = await fetch("/api/gcs-validate", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    accessToken: creds.accessToken || "",
+                    serviceAccountKey: creds.serviceAccountKey || "",
+                    bucket: targetBucket,
+                    projectId: targetProjectId,
+                }),
+            });
             const data = await res.json();
 
-            if (data.hasEnvCredentials || tokenOrKey) {
+            if (data.ok) {
                 setTestResult({
                     ok: true,
-                    message: `Credentials active. Target bucket: ${GCS_BUCKET} (${GCS_PROJECT_ID}). Mode: ${data.credentialsType || "configured"}.`,
+                    message: data.message || `Credentials active! Connected to Google Cloud Storage bucket ${targetBucket} (Project: ${targetProjectId}). Mode: ${data.credentialsType || "service_account"}.`,
                 });
             } else {
                 setTestResult({
                     ok: false,
-                    message: `Notice: No active Google credentials detected for bucket ${GCS_BUCKET}. Files will be cached locally with instant fallback until credentials are provided.`,
+                    message: data.message || `Notice: No active Google credentials detected for bucket ${targetBucket}. Files will be cached locally with instant fallback until credentials are provided.`,
                 });
             }
         } catch (err) {
@@ -89,7 +130,7 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
         }
     };
 
-    const cliCommand = `gcloud storage cp "YOUR_TEMPLATE.pdf" "gs://${GCS_BUCKET}/${GCS_BASE_PATH}/${selectedCategory}/YOUR_TEMPLATE.pdf"`;
+    const cliCommand = `gcloud storage cp "YOUR_TEMPLATE.pdf" "gs://${targetBucket}/${GCS_BASE_PATH}/${selectedCategory}/YOUR_TEMPLATE.pdf"`;
 
     const handleCopyCli = () => {
         navigator.clipboard.writeText(cliCommand);
@@ -110,7 +151,7 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
                         <div>
                             <h3>Google Cloud Storage Target & Credentials</h3>
                             <p className="gcs-modal-sub">
-                                Target Bucket: <code>{GCS_BUCKET}</code> • Project: <code>{GCS_PROJECT_ID}</code>
+                                Target Bucket: <code>{targetBucket}</code> • Project: <code>{targetProjectId}</code>
                             </p>
                         </div>
                     </div>
@@ -147,13 +188,13 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
                     {/* Destination Banner */}
                     <div className="gcs-dest-banner">
                         <div className="gcs-dest-item">
-                            <span className="dest-label">Destination GCS Path:</span>
+                            <span className="dest-label">Generated PDFs Storage Path:</span>
                             <code className="dest-code">
-                                gs://{GCS_BUCKET}/{GCS_BASE_PATH}/{selectedCategory}/[filename.pdf]
+                                gs://{targetBucket}/pdf-generator/generated/[Filled_PDF.pdf]
                             </code>
                         </div>
                         <div className="gcs-dest-item">
-                            <span className="dest-label">Child Folder:</span>
+                            <span className="dest-label">Template Storage:</span>
                             <span className="dest-badge-cat">{selectedCategory}</span>
                             <span className="dest-options-hint">
                                 Available: {GCS_CATEGORY_OPTIONS.join(", ")}
@@ -161,57 +202,95 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
                         </div>
                         <div className="gcs-dest-link-row">
                             <a
-                                 href={`https://console.cloud.google.com/storage/browser/${GCS_BUCKET}/${GCS_BASE_PATH}/${encodeURIComponent(selectedCategory)}?project=${GCS_PROJECT_ID}`}
-                                 target="_blank"
-                                 rel="noreferrer"
-                                 className="gcs-console-link"
-                                 style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
+                                href={`https://console.cloud.google.com/storage/browser/${targetBucket}/pdf-generator/generated?project=${targetProjectId}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="gcs-console-link"
+                                style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
                             >
-                                <ExternalLink size={13} /> Open {selectedCategory} Folder in Google Cloud Console
+                                <ExternalLink size={13} /> Open Generated PDFs Folder in Google Cloud Console
                             </a>
                         </div>
                     </div>
 
                     {activeTab === "setup" && (
                         <div className="gcs-tab-content">
+                            {/* Bucket & Project Configuration */}
+                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "14px" }}>
+                                <div className="gcs-form-group">
+                                    <label className="gcs-field-label">Target Bucket Name</label>
+                                    <input
+                                        type="text"
+                                        className="gcs-text-input"
+                                        placeholder="cdn.vconsultancy.com.au"
+                                        value={creds.bucket || ""}
+                                        onChange={(e) => setCreds({ ...creds, bucket: e.target.value })}
+                                    />
+                                </div>
+                                <div className="gcs-form-group">
+                                    <label className="gcs-field-label">Google Cloud Project ID</label>
+                                    <input
+                                        type="text"
+                                        className="gcs-text-input"
+                                        placeholder="aibt-244204"
+                                        value={creds.projectId || ""}
+                                        onChange={(e) => setCreds({ ...creds, projectId: e.target.value })}
+                                    />
+                                </div>
+                            </div>
+
+                            {/* Service Account JSON Key (Recommended) */}
                             <div className="gcs-form-group">
-                                <label className="gcs-field-label">
-                                    Option 1: Google Cloud Access Token (Bearer)
+                                <label className="gcs-field-label" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                    <span>Option 1: Service Account JSON Key (Recommended)</span>
+                                    {parsedSa && (
+                                        <span style={{ color: "#166534", fontSize: "11px", fontWeight: "700", display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                                            <ShieldCheck size={13} /> Valid Service Account Key
+                                        </span>
+                                    )}
                                 </label>
                                 <p className="gcs-field-hint">
-                                    Generate via terminal: <code>gcloud auth print-access-token</code>
+                                    Paste the JSON key file downloaded from Google Cloud IAM (IAM &amp; Admin &rarr; Service Accounts &rarr; Keys).
+                                </p>
+                                <textarea
+                                    rows={5}
+                                    className="gcs-textarea"
+                                    placeholder='{ "type": "service_account", "project_id": "your-project-id", "private_key_id": "...", "client_email": "name@your-project-id.iam.gserviceaccount.com", ... }'
+                                    value={creds.serviceAccountKey || ""}
+                                    onChange={(e) => handleServiceAccountChange(e.target.value)}
+                                    style={{ fontFamily: "monospace", fontSize: "11.5px" }}
+                                />
+                                {parsedSa && (
+                                    <div style={{ marginTop: "6px", padding: "6px 10px", background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "4px", fontSize: "11.5px", color: "#166534" }}>
+                                        <div><strong>Client Email:</strong> {parsedSa.client_email}</div>
+                                        <div><strong>Project:</strong> {parsedSa.project_id}</div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Option 2: Bearer Access Token */}
+                            <div className="gcs-form-group" style={{ marginTop: "12px" }}>
+                                <label className="gcs-field-label">
+                                    Option 2: Temporary Access Token (Bearer)
+                                </label>
+                                <p className="gcs-field-hint">
+                                    Or paste an OAuth token from terminal: <code>gcloud auth print-access-token</code>
                                 </p>
                                 <input
                                     type="password"
                                     className="gcs-text-input"
                                     placeholder="ya29.a0AfH6SM..."
-                                    value={creds.accessToken}
+                                    value={creds.accessToken || ""}
                                     onChange={(e) => setCreds({ ...creds, accessToken: e.target.value })}
                                 />
                             </div>
 
-                            <div className="gcs-form-group">
-                                <label className="gcs-field-label">
-                                    Option 2: Service Account JSON Key
-                                </label>
-                                <p className="gcs-field-hint">
-                                    Paste raw JSON key from Google Cloud Console (IAM & Admin → Service Accounts → Keys).
-                                </p>
-                                <textarea
-                                    rows={4}
-                                    className="gcs-textarea"
-                                    placeholder='{ "type": "service_account", "project_id": "aibt-244204", ... }'
-                                    value={creds.serviceAccountKey}
-                                    onChange={(e) => setCreds({ ...creds, serviceAccountKey: e.target.value })}
-                                />
-                            </div>
-
                             <div className="gcs-env-note">
-                                <strong>Server-side .env Option:</strong> You can also set{" "}
-                                <code>GCS_ACCESS_TOKEN</code> or <code>GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json</code> in your <code>.env</code> file.
+                                <strong>Environment Alternative:</strong> You can also set{" "}
+                                <code>GCS_SERVICE_ACCOUNT_KEY</code>, <code>GOOGLE_APPLICATION_CREDENTIALS</code>, or <code>GCS_ACCESS_TOKEN</code> in your server environment.
                                 {serverStatus?.hasEnvCredentials && (
                                     <span className="env-badge-detected" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
-                                        <Check size={12} /> Detected in Environment
+                                        <Check size={12} /> Detected on Server
                                     </span>
                                 )}
                             </div>
@@ -239,7 +318,7 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
                                 Legacy <code>gsutil</code> alternative:
                             </p>
                             <div className="cli-code-box">
-                                <code>gsutil cp "YOUR_TEMPLATE.pdf" "gs://{GCS_BUCKET}/${GCS_BASE_PATH}/${selectedCategory}/"</code>
+                                <code>gsutil cp "YOUR_TEMPLATE.pdf" "gs://{targetBucket}/${GCS_BASE_PATH}/${selectedCategory}/"</code>
                             </div>
                         </div>
                     )}
@@ -249,18 +328,17 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
                             <h4>Google Cloud Storage Setup Requirements</h4>
                             <ol className="guide-steps">
                                 <li>
-                                    <strong>Project:</strong> Verify access to project <code>{GCS_PROJECT_ID}</code> in Google Cloud Console.
+                                    <strong>Project:</strong> Verify access to project <code>{targetProjectId}</code> in Google Cloud Console.
                                 </li>
                                 <li>
-                                    <strong>Bucket:</strong> Ensure bucket <code>{GCS_BUCKET}</code> exists with folder <code>{GCS_BASE_PATH}</code>.
+                                    <strong>Bucket:</strong> Ensure bucket <code>{targetBucket}</code> exists with folder <code>pdf-generator/generated/</code>.
                                 </li>
                                 <li>
-                                    <strong>Permissions:</strong> Grant the service account or user account the role{" "}
-                                    <span className="role-tag">Storage Object Creator</span> (or <span className="role-tag">Storage Object Admin</span>).
+                                    <strong>Permissions:</strong> Grant the service account the role{" "}
+                                    <span className="role-tag">Storage Object Creator</span> or <span className="role-tag">Storage Object Admin</span>.
                                 </li>
                                 <li>
-                                    <strong>CORS (For direct in-browser access):</strong> If fetching directly from browser, enable CORS on bucket:
-                                    <pre className="cors-code">{`[{"origin": ["*"], "responseHeader": ["Content-Type"], "method": ["GET", "PUT", "POST"], "maxAgeSeconds": 3600}]`}</pre>
+                                    <strong>Automated Workflow:</strong> When you generate a PDF, clicking <strong>"Store in Cloud"</strong> or running dispatch uploads the file to <code>gs://{targetBucket}/pdf-generator/generated/</code> and logs the public &amp; console URLs.
                                 </li>
                             </ol>
                         </div>
@@ -277,14 +355,14 @@ export default function GoogleCloudCredentialsModal({ isOpen, onClose, selectedC
                             style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
                         >
                             <Zap size={13} />
-                            {isTesting ? "Testing..." : "Test GCS Access"}
+                            {isTesting ? "Testing..." : "Test Connection & Credentials"}
                         </button>
                         <button
                             type="button"
                             className="btn-clear-gcs"
                             onClick={handleClear}
                         >
-                            Clear
+                            Reset
                         </button>
                     </div>
 
