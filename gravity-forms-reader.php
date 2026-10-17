@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PDF Generator - Gravity Forms Reader
  * Description: Read-only Gravity Forms schema reader and automated PDF submission/notification dispatcher for the PDF Generator system.
- * Version: 1.3.0
+ * Version: 1.4.0
  * Author: Nurul Islam
  */
 
@@ -544,6 +544,24 @@ function pfgf_register_rest_routes() {
         )
     );
 
+    // 6. Delete temporary generated PDF for an entry from WordPress storage
+    register_rest_route(
+        'pdf-generator/v1',
+        '/entries/(?P<id>\d+)/pdf',
+        array(
+            'methods'             => WP_REST_Server::DELETABLE,
+            'callback'            => 'pfgf_rest_delete_entry_pdf',
+            'permission_callback' => 'pfgf_rest_permission_check',
+            'args'                => array(
+                'id' => array(
+                    'validate_callback' => function($param) {
+                        return is_numeric($param);
+                    }
+                ),
+            ),
+        )
+    );
+
     add_filter('rest_pre_dispatch', 'pfgf_handle_cors_preflight', 10, 3);
     add_filter('rest_pre_serve_request', 'pfgf_send_cors_headers', 9, 4);
 }
@@ -579,7 +597,7 @@ function pfgf_send_cors_headers($served, $result, WP_REST_Request $request, WP_R
     remove_action('rest_pre_serve_request', 'rest_send_cors_headers');
 
     header('Access-Control-Allow-Origin: *');
-    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    header('Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS');
     header('Access-Control-Allow-Headers: Accept, X-PDF-API-Key, Content-Type, Authorization, ngrok-skip-browser-warning');
 
     return $served;
@@ -937,17 +955,85 @@ function pfgf_rest_upload_entry_pdf(WP_REST_Request $request) {
         }
     }
 
+    // Handle temporary storage cleanup after notification is sent
+    $clean_scheduled = false;
+    $clean_immediately = false;
+    $clean_requested = !empty($request->get_param('clean_after_send'));
+    $delete_delay = absint($request->get_param('delete_delay_seconds'));
+
+    if ($clean_requested && $notification_sent) {
+        if ($delete_delay > 0) {
+            wp_schedule_single_event(time() + $delete_delay, 'pfgf_cleanup_entry_pdf_event', array($pdf_file));
+            $clean_scheduled = true;
+        } else {
+            // Immediate deletion on PHP shutdown (after HTTP response finishes and email handle is released)
+            add_action('shutdown', function() use ($pdf_file) {
+                if (file_exists($pdf_file)) {
+                    @unlink($pdf_file);
+                }
+            });
+            $clean_immediately = true;
+        }
+    }
+
     return rest_ensure_response(array(
-        'success'           => true,
-        'pdf_stored'        => true,
-        'entry_id'          => $entry_id,
-        'form_id'           => $form_id,
-        'filename'          => basename($pdf_file),
-        'file_size'         => $file_size,
+        'success'                => true,
+        'pdf_stored'             => true,
+        'entry_id'               => $entry_id,
+        'form_id'                => $form_id,
+        'filename'               => basename($pdf_file),
+        'file_size'              => $file_size,
         'notification_requested' => $request->get_param('send_notification') ? true : false,
-        'notification_sent' => $notification_sent,
-        'notification_error' => $notification_error,
+        'notification_sent'      => $notification_sent,
+        'notification_error'     => $notification_error,
+        'temporary_storage'      => $clean_requested,
+        'clean_immediately'      => $clean_immediately,
+        'clean_scheduled'        => $clean_scheduled,
+        'delete_delay_seconds'   => $delete_delay,
     ));
+}
+
+
+/**
+ * REST callback for deleting a temporary generated PDF for an entry from WordPress storage.
+ */
+function pfgf_rest_delete_entry_pdf(WP_REST_Request $request) {
+
+    $entry_id = absint($request->get_param('id'));
+    if (!$entry_id) {
+        return new WP_Error('invalid_entry_id', 'A valid entry ID is required.', array('status' => 400));
+    }
+
+    $generated_dir = WP_CONTENT_DIR . '/pdf-generator/generated/';
+    $files = glob($generated_dir . "form-*-entry-{$entry_id}.pdf");
+    $deleted = array();
+
+    if (!empty($files)) {
+        foreach ($files as $file) {
+            if (file_exists($file)) {
+                if (@unlink($file)) {
+                    $deleted[] = basename($file);
+                }
+            }
+        }
+    }
+
+    return rest_ensure_response(array(
+        'success'       => true,
+        'entry_id'      => $entry_id,
+        'deleted'       => count($deleted) > 0,
+        'deleted_files' => $deleted,
+        'message'       => count($deleted) > 0
+            ? "Temporary PDF(s) deleted from WordPress storage: " . implode(', ', $deleted)
+            : "No PDF found on WordPress storage for entry #{$entry_id} (already cleaned).",
+    ));
+}
+
+add_action('pfgf_cleanup_entry_pdf_event', 'pfgf_do_cleanup_entry_pdf');
+function pfgf_do_cleanup_entry_pdf($file_path) {
+    if ($file_path && file_exists($file_path)) {
+        @unlink($file_path);
+    }
 }
 
 

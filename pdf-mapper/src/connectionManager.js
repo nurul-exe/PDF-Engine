@@ -912,3 +912,138 @@ export function saveAutomationSettings(settings) {
     localStorage.setItem(AUTOMATION_CONFIG_KEY, JSON.stringify(settings));
     return settings;
 }
+
+// =========================================================
+// WORDPRESS TEMPORARY STORAGE & EMAIL DISPATCH
+// =========================================================
+
+/**
+ * Push generated PDF from GCP or memory to WordPress storage, trigger Gravity Forms
+ * notification email with PDF attachment, and manage temporary storage cleanup.
+ */
+export async function pushPdfToWordPress({
+    formId,
+    entryId,
+    pdfUrl = "",
+    pdfBytes = null,
+    wordpressUrl = "",
+    apiKey = "",
+    sourceConnectionId = null,
+    sendNotification = true,
+    cleanAfterSend = true,
+    deleteDelaySeconds = 30,
+    action = "manual_push",
+}) {
+    let pdfBytesBase64 = undefined;
+    if (pdfBytes) {
+        let binary = "";
+        const chunkSize = 0x8000;
+        const view = new Uint8Array(pdfBytes);
+        for (let i = 0; i < view.length; i += chunkSize) {
+            binary += String.fromCharCode(...view.subarray(i, i + chunkSize));
+        }
+        pdfBytesBase64 = btoa(binary);
+    }
+
+    const res = await fetch("/api/push-pdf-to-wp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            formId: String(formId || "1"),
+            entryId: String(entryId),
+            pdfUrl: pdfUrl || undefined,
+            pdfBytesBase64,
+            wordpressUrl: wordpressUrl || undefined,
+            apiKey: apiKey || undefined,
+            sourceConnectionId: sourceConnectionId || undefined,
+            sendNotification: Boolean(sendNotification),
+            cleanAfterSend: Boolean(cleanAfterSend),
+            deleteDelaySeconds: Number(deleteDelaySeconds) || 0,
+            action,
+        }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        throw new Error(data.error || `Failed to push PDF to WordPress (HTTP ${res.status})`);
+    }
+    return data;
+}
+
+/**
+ * Manually clean/delete temporary generated PDF from WordPress storage.
+ */
+export async function cleanupWpPdf({
+    entryId,
+    formId,
+    wordpressUrl = "",
+    apiKey = "",
+    sourceConnectionId = null,
+}) {
+    const res = await fetch("/api/cleanup-wp-pdf", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            entryId: String(entryId),
+            formId: formId ? String(formId) : undefined,
+            wordpressUrl: wordpressUrl || undefined,
+            apiKey: apiKey || undefined,
+            sourceConnectionId: sourceConnectionId || undefined,
+        }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        throw new Error(data.error || `Failed to cleanup PDF from WordPress (HTTP ${res.status})`);
+    }
+    return data;
+}
+
+/**
+ * Fetch real-time mail and operation logs from backend.
+ */
+export async function fetchWpDispatchLogs(limit = 100) {
+    try {
+        const res = await fetch(`/api/wp-dispatch-logs?limit=${limit}`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        return Array.isArray(data.logs) ? data.logs : [];
+    } catch (err) {
+        console.warn("Could not fetch dispatch logs:", err);
+        return [];
+    }
+}
+
+/**
+ * Clear mail and operation logs.
+ */
+export async function clearWpDispatchLogs() {
+    const res = await fetch("/api/wp-dispatch-logs", { method: "DELETE" });
+    return res.ok;
+}
+
+/**
+ * Fetch automated dispatcher settings.
+ */
+export async function fetchWpAutomationSettings() {
+    try {
+        const res = await fetch("/api/wp-automation/settings");
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.settings || null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Save automated dispatcher settings.
+ */
+export async function saveWpAutomationSettingsRemote(settings) {
+    const res = await fetch("/api/wp-automation/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+    });
+    return await res.json();
+}

@@ -19,6 +19,12 @@ import {
   upsertSourceForms,
   upsertPdfTemplateRecord,
   deletePdfTemplateRecord,
+  addWpDispatchLog,
+  listWpDispatchLogs,
+  updateWpDispatchLog,
+  clearWpDispatchLogs,
+  getWpAutomationSettings,
+  saveWpAutomationSettings,
 } from './database.js';
 
 import {
@@ -426,20 +432,294 @@ app.post('/api/store-pdf-in-cloud', async (req, res) => {
   }
 });
 
-// Replaced /api/push-pdf-to-wp feature with Store in Cloud
+// Helper to resolve PDF buffer from payload (base64, local /generated, or remote GCS URL)
+async function resolvePdfBufferFromPayload(payload, reqHeaders = {}) {
+  if (payload.pdfBytesBase64) {
+    return Buffer.from(payload.pdfBytesBase64, 'base64');
+  }
+
+  const pdfUrl = payload.pdfUrl || payload.gcpPdfUrl || payload.url;
+  if (!pdfUrl) {
+    throw new Error('No PDF content provided. Specify pdfBytesBase64 or pdfUrl.');
+  }
+
+  // If local generated path
+  if (pdfUrl.startsWith('/generated/')) {
+    const filename = decodeURIComponent(pdfUrl.replace('/generated/', ''));
+    const localPath = path.join(__dirname, 'generated', filename);
+    if (fs.existsSync(localPath)) {
+      return fs.readFileSync(localPath);
+    }
+  }
+
+  // If GCS or remote URL
+  if (pdfUrl.startsWith('http://') || pdfUrl.startsWith('https://')) {
+    const headers = {};
+    if (pdfUrl.includes('storage.googleapis.com')) {
+      const explicitToken = reqHeaders['x-gcs-token'] || payload.customToken;
+      const saKey = reqHeaders['x-gcs-sa-key'] || payload.serviceAccountKey;
+      const token = await getGoogleAccessToken(explicitToken, saKey);
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+    }
+    const resp = await fetch(pdfUrl, { headers });
+    if (!resp.ok) {
+      throw new Error(`Failed to fetch PDF from ${pdfUrl} (HTTP ${resp.status})`);
+    }
+    const arrayBuf = await resp.arrayBuffer();
+    return Buffer.from(arrayBuf);
+  }
+
+  throw new Error(`Unable to resolve PDF buffer from URL: ${pdfUrl}`);
+}
+
+// 4th Step: Push generated PDF from GCP to WordPress storage (temporary store until notification email sent)
 app.post('/api/push-pdf-to-wp', async (req, res) => {
   try {
-    const result = await processStorePdfInCloud(req.body || {}, req.headers);
-    res.json({
-      ...result,
-      notificationRequested: false,
-      notificationSent: false,
-      message: result.message || 'PDF stored in Google Cloud Storage successfully.',
+    const payload = req.body || {};
+    const formId = String(payload.formId || '1');
+    const entryId = String(payload.entryId || '').trim();
+    if (!entryId) {
+      return res.status(400).json({ error: 'entryId is required' });
+    }
+
+    let wordpressUrl = String(payload.wordpressUrl || '').trim();
+    let apiKey = String(payload.apiKey || '').trim();
+    const sourceConnectionId = payload.sourceConnectionId;
+
+    if (sourceConnectionId && (!wordpressUrl || !apiKey)) {
+      try {
+        const conn = await getSourceConnection(sourceConnectionId);
+        if (conn && conn.url && !wordpressUrl) {
+          wordpressUrl = conn.url;
+        }
+        if (!apiKey) {
+          apiKey = (await getSourceConnectionApiKey(sourceConnectionId)) || '';
+        }
+      } catch (e) {
+        console.warn('[Server] Could not lookup source connection for WP push:', e.message);
+      }
+    }
+
+    if (!wordpressUrl) {
+      return res.status(400).json({ error: 'Target WordPress URL is required.' });
+    }
+
+    const cleanWpUrl = wordpressUrl.replace(/\/+$/, '');
+    const sendNotification = payload.sendNotification !== false;
+    const cleanAfterSend = payload.cleanAfterSend !== false;
+    const deleteDelaySeconds = Number.isInteger(payload.deleteDelaySeconds) ? payload.deleteDelaySeconds : 30;
+
+    // Resolve PDF buffer (from GCP URL, local generated, or base64)
+    const pdfBuffer = await resolvePdfBufferFromPayload(payload, req.headers);
+    if (!pdfBuffer || pdfBuffer.length === 0) {
+      throw new Error('PDF content was empty.');
+    }
+    const pdfBytesBase64 = pdfBuffer.toString('base64');
+
+    // Build WP endpoint
+    const queryParams = new URLSearchParams();
+    queryParams.set('send_notification', sendNotification ? '1' : '0');
+    if (cleanAfterSend) {
+      queryParams.set('clean_after_send', '1');
+      queryParams.set('delete_delay_seconds', String(deleteDelaySeconds));
+    }
+
+    const wpEndpoint = `${cleanWpUrl}/wp-json/pdf-generator/v1/entries/${encodeURIComponent(entryId)}/pdf?${queryParams.toString()}`;
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    };
+    if (apiKey) {
+      headers['X-PDF-API-Key'] = apiKey;
+    }
+
+    console.log(`[Server] Pushing PDF for Entry #${entryId} to WordPress: ${wpEndpoint}`);
+
+    const wpResponse = await fetch(wpEndpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ pdfBytesBase64 }),
+    });
+
+    const wpData = await wpResponse.json().catch(() => ({}));
+
+    if (!wpResponse.ok) {
+      const errMsg = wpData.message || wpData.error || `WordPress rejected PDF push (HTTP ${wpResponse.status})`;
+      // Log failure
+      await addWpDispatchLog({
+        formId,
+        entryId,
+        action: payload.action || 'manual',
+        wordpressUrl: cleanWpUrl,
+        gcpPdfUrl: payload.gcpPdfUrl || payload.pdfUrl || '',
+        wpFilename: `form-${formId}-entry-${entryId}.pdf`,
+        fileSize: pdfBuffer.length,
+        notificationRequested: sendNotification,
+        notificationSent: false,
+        notificationError: errMsg,
+        cleanupStatus: 'failed',
+        status: 'error',
+        message: errMsg,
+      });
+      return res.status(wpResponse.status).json({
+        success: false,
+        error: errMsg,
+        wpData,
+      });
+    }
+
+    // Success response
+    const notificationSent = Boolean(wpData.notification_sent);
+    const notificationError = wpData.notification_error || null;
+    const cleanupStatus = cleanAfterSend ? (deleteDelaySeconds > 0 ? 'scheduled' : 'cleaned') : 'retained';
+
+    const logEntry = await addWpDispatchLog({
+      formId,
+      entryId,
+      action: payload.action || 'manual',
+      wordpressUrl: cleanWpUrl,
+      gcpPdfUrl: payload.gcpPdfUrl || payload.pdfUrl || '',
+      wpFilename: wpData.filename || `form-${formId}-entry-${entryId}.pdf`,
+      fileSize: wpData.file_size || pdfBuffer.length,
+      notificationRequested: sendNotification,
+      notificationSent,
+      notificationError,
+      cleanupStatus,
+      status: notificationError ? 'warning' : 'success',
+      message: notificationSent
+        ? `PDF pushed to WordPress. Gravity Forms notification dispatched successfully!${cleanAfterSend ? ` (Temporary storage cleanup: ${deleteDelaySeconds > 0 ? `scheduled in ${deleteDelaySeconds}s` : 'completed'})` : ''}`
+        : `PDF stored on WordPress.${notificationError ? ` Notification error: ${notificationError}` : ' (Notification not requested)'}`,
+    });
+
+    // Server-side cleanup timer guarantee (deletes the temporary file after delay)
+    if (cleanAfterSend) {
+      const waitMs = Math.max(1500, (deleteDelaySeconds || 0) * 1000);
+      setTimeout(async () => {
+        try {
+          const deleteUrl = `${cleanWpUrl}/wp-json/pdf-generator/v1/entries/${encodeURIComponent(entryId)}/pdf`;
+          const delRes = await fetch(deleteUrl, {
+            method: 'DELETE',
+            headers: apiKey ? { 'X-PDF-API-Key': apiKey } : {},
+          });
+          const delData = await delRes.json().catch(() => ({}));
+          console.log(`[Server] Automated cleanup for Entry #${entryId} on WP:`, delData?.message || delRes.status);
+          await updateWpDispatchLog(logEntry.id, {
+            cleanupStatus: 'cleaned',
+            cleanupTime: new Date().toISOString(),
+          });
+        } catch (delErr) {
+          console.warn(`[Server] Automated cleanup check for Entry #${entryId} notice:`, delErr.message);
+        }
+      }, waitMs);
+    }
+
+    return res.json({
+      success: true,
+      pdfStored: true,
+      entryId,
+      formId,
+      filename: wpData.filename || `form-${formId}-entry-${entryId}.pdf`,
+      fileSize: wpData.file_size || pdfBuffer.length,
+      notificationRequested: sendNotification,
+      notificationSent,
+      notificationError,
+      cleanupStatus,
+      deleteDelaySeconds,
+      wpData,
+      logId: logEntry.id,
+      message: logEntry.message,
     });
   } catch (err) {
-    console.error('[Server] Store in Cloud error:', err);
-    res.status(400).json({ error: err.message });
+    console.error('[Server] Push PDF to WP failed:', err);
+    res.status(500).json({ error: err.message });
   }
+});
+
+// Manual cleanup of temporary generated PDF from WordPress site storage
+app.delete('/api/cleanup-wp-pdf', async (req, res) => {
+  try {
+    const { entryId, wordpressUrl, apiKey, sourceConnectionId } = req.body || req.query || {};
+    if (!entryId) {
+      return res.status(400).json({ error: 'entryId is required' });
+    }
+
+    let targetWpUrl = wordpressUrl;
+    let targetApiKey = apiKey;
+    if (sourceConnectionId && (!targetWpUrl || !targetApiKey)) {
+      try {
+        const conn = await getSourceConnection(sourceConnectionId);
+        if (conn?.url && !targetWpUrl) targetWpUrl = conn.url;
+        if (!targetApiKey) targetApiKey = (await getSourceConnectionApiKey(sourceConnectionId)) || '';
+      } catch {}
+    }
+
+    if (!targetWpUrl) {
+      return res.status(400).json({ error: 'wordpressUrl is required' });
+    }
+
+    const cleanWpUrl = targetWpUrl.replace(/\/+$/, '');
+    const deleteUrl = `${cleanWpUrl}/wp-json/pdf-generator/v1/entries/${encodeURIComponent(entryId)}/pdf`;
+    const delRes = await fetch(deleteUrl, {
+      method: 'DELETE',
+      headers: targetApiKey ? { 'X-PDF-API-Key': targetApiKey } : {},
+    });
+
+    const delData = await delRes.json().catch(() => ({}));
+    return res.json({
+      success: delRes.ok,
+      status: delRes.status,
+      deleted: Boolean(delData.deleted),
+      message: delData.message || (delRes.ok ? 'Temporary PDF cleaned from WordPress storage.' : `Delete request returned HTTP ${delRes.status}`),
+      details: delData,
+    });
+  } catch (err) {
+    console.error('[Server] Cleanup WP PDF error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mail & Operation Logs Endpoints
+app.get('/api/wp-dispatch-logs', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 100;
+    const logs = await listWpDispatchLogs(limit);
+    res.json({ success: true, logs });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/wp-dispatch-logs', async (req, res) => {
+  try {
+    await clearWpDispatchLogs();
+    res.json({ success: true, message: 'Logs cleared successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Automated Send Daemon Settings
+app.get('/api/wp-automation/settings', (req, res) => {
+  res.json({ success: true, settings: getWpAutomationSettings() });
+});
+
+app.post('/api/wp-automation/settings', (req, res) => {
+  const updated = saveWpAutomationSettings(req.body || {});
+  res.json({ success: true, settings: updated });
+});
+
+// Download plugin zip
+app.get('/api/download-plugin', (req, res) => {
+  const zipPath = path.join(__dirname, 'gravity-forms-reader.zip');
+  if (fs.existsSync(zipPath)) {
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="gravity-forms-reader.zip"');
+    return fs.createReadStream(zipPath).pipe(res);
+  }
+  res.status(404).json({ error: 'Plugin archive not found' });
 });
 
 // API: Save Mapping

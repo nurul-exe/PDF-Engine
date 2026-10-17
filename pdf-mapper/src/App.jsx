@@ -21,6 +21,7 @@ import WpConnectionModal from "./WpConnectionModal";
 import TopNavigation from "./components/TopNavigation";
 import TemplateIngestionPage from "./components/TemplateIngestionPage";
 import AutomationDispatchPage from "./components/AutomationDispatchPage";
+import WordPressIntegrationPage from "./components/WordPressIntegrationPage";
 import WpConnectionManagerModal from "./components/WpConnectionManagerModal";
 import TemplateIngestModal from "./components/TemplateIngestModal";
 import WpSourceModal from "./components/WpSourceModal";
@@ -534,11 +535,13 @@ try {
 }
 
 function App() {
-    // 3-page routing state (/analyze, /mapper, /automation)
+    // 4-page routing state (/analyze, /mapper, /automation, /wp-integration)
     const [currentRoute, setCurrentRoute] = useState(() => {
         const path = window.location.pathname.toLowerCase();
         if (path.includes("analyze")) return "/analyze";
         if (path.includes("automation")) return "/automation";
+        if (path.includes("wp-integration") || path.includes("wordpress")) return "/wp-integration";
+        if (path.includes("mapper")) return "/mapper";
         return "/analyze";
     });
 
@@ -553,6 +556,7 @@ function App() {
             const path = window.location.pathname.toLowerCase();
             if (path.includes("analyze")) setCurrentRoute("/analyze");
             else if (path.includes("automation")) setCurrentRoute("/automation");
+            else if (path.includes("wp-integration") || path.includes("wordpress")) setCurrentRoute("/wp-integration");
             else setCurrentRoute("/mapper");
         };
         window.addEventListener("popstate", handlePopState);
@@ -2012,6 +2016,25 @@ function App() {
                     wordpressFormsUrl={activeWpConn?.url}
                     sourceConnectionId={activeWpConn?.id || null}
                     onOpenTester={() => setIsTesterOpen(true)}
+                />
+            )}
+
+            {/* ROUTE 4: /wp-integration (WordPress Integration, Temporary Staging & Gravity Forms Email Dispatch) */}
+            {currentRoute === "/wp-integration" && (
+                <WordPressIntegrationPage
+                    forms={forms}
+                    selectedForm={selectedForm}
+                    onSelectForm={(formId) => {
+                        const found = forms.find((f) => String(f.id) === String(formId));
+                        if (found) setSelectedForm(found);
+                    }}
+                    pdfTemplates={pdfTemplatesList}
+                    activePdfTemplate={activePdfTemplate}
+                    mappings={mappings}
+                    pdfTemplateUrl={currentPdfSource}
+                    activeWpConn={activeWpConn}
+                    wpConnections={wpConnections}
+                    sourceConnectionId={activeWpConn?.id || null}
                 />
             )}
 

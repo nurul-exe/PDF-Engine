@@ -842,3 +842,138 @@ export async function runDatabaseMigrations() {
     await migrationPool.end();
   }
 }
+
+// In-memory logs store
+const memWpDispatchLogs = [];
+let memWpAutomationSettings = {
+  enabled: false,
+  formId: '',
+  sourceConnectionId: '',
+  pollIntervalSeconds: 15,
+  cleanAfterSend: true,
+  deleteDelaySeconds: 30,
+  sendNotification: true,
+};
+
+export async function addWpDispatchLog(entry) {
+  const logItem = {
+    id: entry.id || `log-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: entry.timestamp || new Date().toISOString(),
+    formId: String(entry.formId || ''),
+    entryId: String(entry.entryId || ''),
+    action: entry.action || 'manual',
+    wordpressUrl: entry.wordpressUrl || '',
+    gcpPdfUrl: entry.gcpPdfUrl || '',
+    wpFilename: entry.wpFilename || '',
+    fileSize: entry.fileSize || 0,
+    notificationRequested: Boolean(entry.notificationRequested),
+    notificationSent: Boolean(entry.notificationSent),
+    notificationError: entry.notificationError || null,
+    cleanupStatus: entry.cleanupStatus || 'retained',
+    cleanupTime: entry.cleanupTime || null,
+    status: entry.status || 'success',
+    message: entry.message || '',
+  };
+
+  memWpDispatchLogs.unshift(logItem);
+  if (memWpDispatchLogs.length > 300) {
+    memWpDispatchLogs.pop();
+  }
+
+  try {
+    await queryRuntime(
+      `INSERT INTO wp_dispatch_logs (id, form_id, entry_id, action, wordpress_url, gcp_pdf_url, wp_filename, file_size, notification_sent, cleanup_status, status, message, payload_json)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+       ON CONFLICT (id) DO UPDATE SET
+         cleanup_status = EXCLUDED.cleanup_status,
+         notification_sent = EXCLUDED.notification_sent,
+         status = EXCLUDED.status,
+         message = EXCLUDED.message,
+         payload_json = EXCLUDED.payload_json,
+         updated_at = NOW()`,
+      [
+        logItem.id,
+        logItem.formId,
+        logItem.entryId,
+        logItem.action,
+        logItem.wordpressUrl,
+        logItem.gcpPdfUrl,
+        logItem.wpFilename,
+        logItem.fileSize,
+        logItem.notificationSent,
+        logItem.cleanupStatus,
+        logItem.status,
+        logItem.message,
+        JSON.stringify(logItem),
+      ]
+    );
+  } catch {
+    // In-memory fallback
+  }
+
+  return logItem;
+}
+
+export async function updateWpDispatchLog(id, patch) {
+  const item = memWpDispatchLogs.find(l => l.id === id);
+  if (item) {
+    Object.assign(item, patch);
+  }
+  try {
+    if (patch.cleanupStatus) {
+      await queryRuntime(
+        `UPDATE wp_dispatch_logs SET cleanup_status = $1, updated_at = NOW() WHERE id = $2`,
+        [patch.cleanupStatus, id]
+      );
+    }
+  } catch {}
+  return item;
+}
+
+export async function listWpDispatchLogs(limit = 100) {
+  try {
+    const res = await queryRuntime(
+      `SELECT * FROM wp_dispatch_logs ORDER BY created_at DESC LIMIT $1`,
+      [limit]
+    );
+    if (res && res.rows && res.rows.length > 0) {
+      return res.rows.map(r => ({
+        id: r.id,
+        timestamp: r.created_at,
+        formId: r.form_id,
+        entryId: r.entry_id,
+        action: r.action,
+        wordpressUrl: r.wordpress_url,
+        gcpPdfUrl: r.gcp_pdf_url,
+        wpFilename: r.wp_filename,
+        fileSize: Number(r.file_size) || 0,
+        notificationSent: r.notification_sent,
+        cleanupStatus: r.cleanup_status,
+        status: r.status,
+        message: r.message,
+        ...(r.payload_json || {}),
+      }));
+    }
+  } catch {}
+  return memWpDispatchLogs.slice(0, limit);
+}
+
+export async function clearWpDispatchLogs() {
+  memWpDispatchLogs.length = 0;
+  try {
+    await queryRuntime(`DELETE FROM wp_dispatch_logs`);
+  } catch {}
+  return true;
+}
+
+export function getWpAutomationSettings() {
+  return { ...memWpAutomationSettings };
+}
+
+export function saveWpAutomationSettings(settings) {
+  memWpAutomationSettings = {
+    ...memWpAutomationSettings,
+    ...settings,
+  };
+  return { ...memWpAutomationSettings };
+}

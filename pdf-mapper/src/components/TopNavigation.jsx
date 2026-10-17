@@ -11,6 +11,7 @@ import {
     Send,
     Database,
     Cloud,
+    Mail,
 } from "lucide-react";
 import "./TopNavigation.css";
 
@@ -125,6 +126,16 @@ export default function TopNavigation({
                     >
                         <span className="tab-step-num"><Send size={13} /></span>
                         <span className="tab-title">Automation & Dispatch</span>
+                    </button>
+
+                    <button
+                        type="button"
+                        id="nav-tab-wp-integration"
+                        className={`nav-tab-item ${currentRoute === "/wp-integration" ? "is-active" : ""}`}
+                        onClick={() => onNavigate("/wp-integration")}
+                    >
+                        <span className="tab-step-num"><Mail size={13} /></span>
+                        <span className="tab-title">WP Integration & Mail</span>
                     </button>
                 </nav>
             </div>
