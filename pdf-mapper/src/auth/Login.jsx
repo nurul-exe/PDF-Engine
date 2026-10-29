@@ -66,7 +66,6 @@ export default function Login() {
             </svg>
             <span className="login-brand-title">PDF ENGINE</span>
           </div>
-          <h1 className="login-heading">Login</h1>
         </div>
 
         {/* Error Alert */}
@@ -146,7 +145,7 @@ export default function Login() {
             ) : (
               <>
                 <ShieldCheck size={16} />
-                <span>Sign In to Dashboard</span>
+                <span>Login</span>
               </>
             )}
           </button>
